@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -52,10 +53,23 @@ class AdbCommandResult {
   }
 }
 
+/// The device or adb build cannot do session streaming; use a classic `adb install` instead.
+class AdbStreamingUnsupported implements Exception {
+  AdbStreamingUnsupported(this.message);
+  final String message;
+  @override
+  String toString() => 'Streaming install unsupported: $message';
+}
+
 class AdbService {
   Future<String?> _adb() => AdbPaths.resolveAdbExecutable();
 
   static const _timeout = Duration(seconds: 25);
+
+  /// Installs and OBB copies of multi-GB games can take many minutes over USB 2.
+  static const installTimeout = Duration(minutes: 45);
+
+  static final _sdkBySerial = <String, int?>{};
 
   Future<String> _run(
     List<String> args, {
@@ -66,19 +80,25 @@ class AdbService {
     return r.combinedOutput;
   }
 
+  Future<String> _requireAdb() async {
+    final adb = await _adb();
+    if (adb == null) {
+      throw StateError(
+        'adb not found. Copy Android platform-tools into the "adb" folder next to this app, then restart.',
+      );
+    }
+    return adb;
+  }
+
   Future<AdbCommandResult> _runResult(
     List<String> args, {
     String? serial,
     Map<String, String>? environment,
+    Duration timeout = _timeout,
   }) async {
-    final adb = await _adb();
-    if (adb == null) {
-      throw StateError(
-        'adb.exe not found. Copy Android platform-tools into the "adb" folder next to this app, then restart.',
-      );
-    }
+    final adb = await _requireAdb();
     final full = <String>[if (serial != null) ...['-s', serial], ...args];
-    final r = await Process.run(adb, full, environment: environment, runInShell: false).timeout(_timeout);
+    final r = await Process.run(adb, full, environment: environment, runInShell: false).timeout(timeout);
     return AdbCommandResult(
       exitCode: r.exitCode,
       stdout: r.stdout is String ? r.stdout as String : '',
@@ -138,7 +158,7 @@ class AdbService {
     bool replace = true,
   }) async {
     final args = <String>['install', if (replace) '-r', apkPath];
-    return _runResult(args, serial: serial);
+    return _runResult(args, serial: serial, timeout: installTimeout);
   }
 
   /// Installs split bundles together (required for XAPK / multiple APKs).
@@ -149,7 +169,174 @@ class AdbService {
   }) async {
     if (apkPaths.isEmpty) throw ArgumentError('apkPaths empty');
     final args = <String>['install-multiple', if (replace) '-r', ...apkPaths];
-    return _runResult(args, serial: serial);
+    return _runResult(args, serial: serial, timeout: installTimeout);
+  }
+
+  /// `ro.build.version.sdk`, cached per device for this run.
+  Future<int?> deviceSdk(String serial) async {
+    if (_sdkBySerial.containsKey(serial)) return _sdkBySerial[serial];
+    int? sdk;
+    try {
+      sdk = int.tryParse((await _run(['shell', 'getprop', 'ro.build.version.sdk'], serial: serial)).trim());
+    } catch (_) {}
+    _sdkBySerial[serial] = sdk;
+    return sdk;
+  }
+
+  static final _safeShellArg = RegExp(r'^[A-Za-z0-9._/+=@-]+$');
+
+  /// Runs `adb exec-in <command>` feeding [data] to the device command's stdin.
+  /// Returns combined stdout/stderr; [onBytes] reports bytes as they are handed to adb.
+  Future<AdbCommandResult> _execIn(
+    String serial,
+    String command,
+    Stream<List<int>> data, {
+    void Function(int delta)? onBytes,
+  }) async {
+    final adb = await _requireAdb();
+    final proc = await Process.start(adb, ['-s', serial, 'exec-in', command]);
+    final out = proc.stdout.transform(const SystemEncoding().decoder).join();
+    final err = proc.stderr.transform(const SystemEncoding().decoder).join();
+    try {
+      await proc.stdin.addStream(onBytes == null
+          ? data
+          : data.map((c) {
+              onBytes(c.length);
+              return c;
+            }));
+    } catch (_) {
+      // adb exited early (e.g. device rejected the command); the exit code below explains why.
+    }
+    try {
+      await proc.stdin.close();
+    } catch (_) {}
+    final code = await proc.exitCode.timeout(installTimeout, onTimeout: () {
+      proc.kill();
+      return -1;
+    });
+    return AdbCommandResult(exitCode: code, stdout: await out, stderr: await err);
+  }
+
+  /// Installs [parts] by streaming each one straight into a PackageManager session
+  /// (`install-create` → `install-write … -` → `install-commit`), the same protocol
+  /// `adb install-multiple` uses, but fed from memory so nothing has to be unpacked to disk first.
+  ///
+  /// Throws [AdbStreamingUnsupported] when the device/adb refuses the streaming protocol before any
+  /// data was committed, so the caller can fall back to a classic install.
+  Future<AdbCommandResult> streamInstall({
+    required String serial,
+    required List<({String name, int size, Future<Stream<List<int>>> Function() open})> parts,
+    bool replace = true,
+    void Function(int delta)? onBytes,
+  }) async {
+    if (parts.isEmpty) throw ArgumentError('parts empty');
+    final sdk = await deviceSdk(serial);
+    if (sdk != null && sdk < 21) throw AdbStreamingUnsupported('Android API $sdk has no install sessions');
+    final pm = (sdk ?? 0) >= 24 ? 'cmd package' : 'pm';
+    final total = parts.fold<int>(0, (a, b) => a + b.size);
+
+    final create = await _runResult(
+      ['shell', '$pm install-create${replace ? ' -r' : ''} -S $total'],
+      serial: serial,
+    );
+    final sessionM = RegExp(r'\[(\d+)\]').firstMatch(create.combinedOutput);
+    if (sessionM == null) {
+      throw AdbStreamingUnsupported('install-create: ${create.combinedOutput}');
+    }
+    final session = sessionM.group(1)!;
+    var ok = false;
+    try {
+      for (var i = 0; i < parts.length; i++) {
+        final part = parts[i];
+        var name = '${i}_${part.name}'.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
+        if (!_safeShellArg.hasMatch(name)) name = '$i.apk';
+        final w = await _execIn(
+          serial,
+          '$pm install-write -S ${part.size} $session $name -',
+          await part.open(),
+          onBytes: onBytes,
+        );
+        if (!w.combinedOutput.toLowerCase().contains('success')) {
+          if (i == 0 && w.combinedOutput.trim().isEmpty) {
+            throw AdbStreamingUnsupported('install-write produced no output (exit ${w.exitCode})');
+          }
+          return AdbCommandResult(
+            exitCode: w.exitCode == 0 ? 1 : w.exitCode,
+            stdout: 'Failure [install-write ${part.name}] ${w.stdout}',
+            stderr: w.stderr,
+          );
+        }
+      }
+      final commit = await _runResult(
+        ['shell', '$pm install-commit $session'],
+        serial: serial,
+        timeout: installTimeout,
+      );
+      ok = commit.installSucceeded;
+      return commit;
+    } finally {
+      if (!ok) {
+        try {
+          await _runResult(['shell', '$pm install-abandon $session'], serial: serial);
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// Streams [data] to [devicePath] (e.g. an OBB under `/sdcard/Android/obb/`) without a temp file.
+  Future<AdbCommandResult> pushStream({
+    required String serial,
+    required String devicePath,
+    required int size,
+    required Stream<List<int>> data,
+    void Function(int delta)? onBytes,
+  }) async {
+    if (!_safeShellArg.hasMatch(devicePath)) {
+      throw ArgumentError('Unsafe device path: $devicePath');
+    }
+    final dir = devicePath.substring(0, devicePath.lastIndexOf('/'));
+    final w = await _execIn(
+      serial,
+      "sh -c 'mkdir -p $dir && cat > $devicePath.part && mv $devicePath.part $devicePath && (stat -c %s $devicePath 2>/dev/null || wc -c < $devicePath)'",
+      data,
+      onBytes: onBytes,
+    );
+    final written = int.tryParse(w.stdout.trim().split(RegExp(r'\s+')).last);
+    if (written != size) {
+      return AdbCommandResult(
+        exitCode: w.exitCode == 0 ? 1 : w.exitCode,
+        stdout: 'Failure copying ${devicePath.split('/').last} (got ${written ?? '?'} of $size bytes)',
+        stderr: w.stderr,
+      );
+    }
+    return AdbCommandResult(exitCode: 0, stdout: 'Success', stderr: '');
+  }
+
+  /// `versionName` for each of [packages] in a single adb round-trip (null = not installed).
+  ///
+  /// Replaces one `pm path` + one `dumpsys` call per library row.
+  Future<Map<String, String?>> installedVersionNames(String serial, Iterable<String> packages) async {
+    final valid = packages.where((p) => RegExp(r'^[A-Za-z0-9_.]+$').hasMatch(p)).toSet().toList();
+    final result = <String, String?>{for (final p in valid) p: null};
+    const chunk = 60;
+    for (var i = 0; i < valid.length; i += chunk) {
+      final slice = valid.sublist(i, i + chunk > valid.length ? valid.length : i + chunk);
+      final script = 'for p in ${slice.join(' ')}; do echo "@@\$p"; '
+          'dumpsys package \$p | grep -m1 versionName=; done';
+      final out = await _run(['shell', script], serial: serial);
+      String? current;
+      for (final line in const LineSplitter().convert(out)) {
+        final t = line.trim();
+        if (t.startsWith('@@')) {
+          current = t.substring(2);
+          continue;
+        }
+        if (current == null) continue;
+        final m = RegExp(r'versionName=([^\s]+)').firstMatch(t);
+        if (m != null && result[current] == null) result[current] = m.group(1);
+      }
+    }
+    return result;
   }
 
   Future<AdbCommandResult> uninstallUserApp(String serial, String packageName) async {

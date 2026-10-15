@@ -88,7 +88,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
         const SizedBox(height: 6),
         Text(
           'Enabled stores are queried in order and combined (first store wins duplicates). Preference is saved.',
-          style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54, height: 1.35),
+          style: theme.textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant, height: 1.35),
         ),
       ],
     );
@@ -195,7 +195,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
                 children: [
                   Text(
                     'Downloads keep running if you switch tabs (e.g. to Downloads).',
-                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54, height: 1.4),
+                    style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant, height: 1.4),
                   ),
                   const SizedBox(height: 12),
                   _buildStoreSourceChips(context),
@@ -229,7 +229,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
                         ? Center(
                             child: Text(
                               'Results appear here.',
-                              style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: Colors.black45),
+                              style: Theme.of(context).textTheme.bodyLarge?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                             ),
                           )
                         : ListView.separated(
@@ -274,7 +274,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
                           child: Text(
                             'Select an app to see version, release date, and download.',
                             textAlign: TextAlign.center,
-                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Colors.black54),
+                            style: Theme.of(context).textTheme.bodyMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                           ),
                         )
                       : _detailError != null
@@ -331,7 +331,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          SizedBox(width: 110, child: Text(k, style: t.labelLarge?.copyWith(color: Colors.black54))),
+          SizedBox(width: 110, child: Text(k, style: t.labelLarge?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant))),
           Expanded(child: Text(v, style: t.bodyLarge)),
         ],
       ),

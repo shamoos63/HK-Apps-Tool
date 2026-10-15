@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 
+import 'app_theme.dart';
 import 'services/apk_library_folder_helper.dart';
 import 'services/app_paths.dart';
 import 'services/download_queue.dart';
@@ -94,7 +95,7 @@ class DownloadsPage extends StatelessWidget {
               'When you start a download from Search or Install, this tab opens so you can follow progress and speed. '
               'The rail shows a badge with how many downloads are active. '
               'Failures usually mean the CDN returned a web page or a bad link — try again or pick another store result.',
-              style: theme.textTheme.bodySmall?.copyWith(color: Colors.black54),
+              style: theme.textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
             const SizedBox(height: 16),
             Expanded(
@@ -107,7 +108,7 @@ class DownloadsPage extends StatelessWidget {
                       child: Text(
                         'No downloads yet.\nUse Search & download or "Download newer" on the Install tab.',
                         textAlign: TextAlign.center,
-                        style: theme.textTheme.bodyLarge?.copyWith(color: Colors.black45),
+                        style: theme.textTheme.bodyLarge?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                       ),
                     );
                   }
@@ -193,12 +194,12 @@ class _DownloadTaskCard extends StatelessWidget {
             if (ok) ...[
               Row(
                 children: [
-                  Icon(Icons.check_circle_rounded, color: Colors.green.shade700, size: 22),
+                  Icon(Icons.check_circle_rounded, color: Theme.of(context).colorScheme.success, size: 22),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       'Finished · ${DownloadsPage._formatBytes(task.received)}',
-                      style: theme.textTheme.labelLarge?.copyWith(color: Colors.green.shade900),
+                      style: theme.textTheme.labelLarge?.copyWith(color: Theme.of(context).colorScheme.success),
                     ),
                   ),
                 ],
@@ -235,7 +236,7 @@ class _DownloadTaskCard extends StatelessWidget {
               ),
             ],
             if (task.status == DownloadTaskStatus.queued)
-              Text('Queued…', style: theme.textTheme.labelMedium?.copyWith(color: Colors.black54)),
+              Text('Queued…', style: theme.textTheme.labelMedium?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant)),
           ],
         ),
       ),

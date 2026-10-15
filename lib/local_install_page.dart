@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:collection/collection.dart';
+import 'package:desktop_drop/desktop_drop.dart';
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import 'app_theme.dart';
 import 'services/aapt_service.dart';
 import 'services/adb_paths.dart';
 import 'services/adb_service.dart';
@@ -14,9 +16,15 @@ import 'services/apk_library_folder_helper.dart';
 import 'services/app_paths.dart';
 import 'services/combined_apk_store_service.dart';
 import 'services/download_queue.dart';
+import 'services/install_queue.dart';
 import 'services/library_apk_metadata_cache.dart';
 import 'services/xapk_service.dart';
+import 'ui/install_queue_panel.dart';
 import 'widgets/branded_app_bar.dart';
+
+const _installableExtensions = {'.apk', '.xapk', '.apks'};
+
+bool _isInstallable(String path) => _installableExtensions.contains(p.extension(path).toLowerCase());
 
 class LocalInstallPage extends StatefulWidget {
   const LocalInstallPage({super.key});
@@ -47,22 +55,7 @@ class _LocalRow {
 
   String get path => file.path;
   String get displayName => p.basename(path);
-}
-
-class _InstallActivity {
-  _InstallActivity({
-    required this.id,
-    required this.label,
-    required this.filePath,
-  });
-
-  final String id;
-  final String label;
-  /// Same as [_LocalRow.path] so progress appears under that card.
-  final String filePath;
-  bool running = true;
-  bool? success;
-  String detail = '';
+  String get label => badging?.label ?? title ?? displayName;
 }
 
 class _LocalInstallPageState extends State<LocalInstallPage> {
@@ -70,36 +63,22 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
   final _aapt = AaptService();
   final _xapk = XapkService();
   final _store = CombinedApkStoreService.shared;
+  final _queue = InstallQueue.instance;
   final TextEditingController _librarySearchCtl = TextEditingController();
+  StreamSubscription<InstallJob>? _finishedSub;
 
   static const _metaConcurrency = 6;
-  static const _maxConcurrentInstalls = 5;
-  static const _maxActivityRows = 10;
-  var _parallelInstallCount = 0;
-  final List<_InstallActivity> _installActivities = [];
 
   List<AdbDevice> _devices = [];
   String? _serial;
+  /// Install to every connected device at once (only offered with 2+ devices).
+  bool _allDevices = false;
   List<_LocalRow> _rows = [];
+  final Set<String> _selected = {};
   bool _scanning = false;
+  bool _dragging = false;
   String? _adbError;
   Map<String, String>? _deviceProps;
-
-  String _libraryHeaderSubtitle() {
-    final installing = _installActivities.where((a) => a.running).length;
-    late final String deviceLine;
-    if (_devices.isEmpty) {
-      deviceLine = 'No USB device — Scan device in app bar';
-    } else {
-      final serial = _serial;
-      final d = serial != null
-          ? _devices.firstWhere((x) => x.serial == serial, orElse: () => _devices.first)
-          : _devices.first;
-      deviceLine = d.shortLabel;
-    }
-    if (installing > 0) return '$installing installing · $deviceLine';
-    return deviceLine;
-  }
 
   List<_LocalRow> get _filteredLibraryRows {
     final q = _librarySearchCtl.text.trim().toLowerCase();
@@ -117,15 +96,11 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     return _rows.where(hit).toList();
   }
 
-  String _libraryFolderExpansionTitle() {
-    if (_rows.isEmpty) return 'Device & APK folder';
-    final total = _rows.length;
-    final q = _librarySearchCtl.text.trim();
-    if (q.isEmpty) {
-      return 'Device & folder · $total ${total == 1 ? 'app' : 'apps'}';
-    }
-    final visible = _filteredLibraryRows.length;
-    return 'Device & folder · $visible of $total matching';
+  List<AdbDevice> get _targets {
+    if (_devices.isEmpty) return const [];
+    if (_allDevices && _devices.length > 1) return _devices;
+    final d = _devices.firstWhereOrNull((x) => x.serial == _serial) ?? _devices.first;
+    return [d];
   }
 
   @override
@@ -134,11 +109,16 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     _librarySearchCtl.addListener(() {
       if (mounted) setState(() {});
     });
-    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshPackages());
+    _finishedSub = _queue.finished.listen(_onJobFinished);
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      await _refreshPackages();
+      if (mounted && _devices.isEmpty) unawaited(_scanDevices());
+    });
   }
 
   @override
   void dispose() {
+    _finishedSub?.cancel();
     _librarySearchCtl.dispose();
     super.dispose();
   }
@@ -198,9 +178,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       if (row.file.existsSync()) {
         await row.file.delete();
       }
-      setState(() {
-        _installActivities.removeWhere((a) => a.filePath == row.path);
-      });
+      setState(() => _selected.remove(row.path));
       await _refreshPackages();
       _toast('Deleted ${row.displayName}');
     } catch (e) {
@@ -228,7 +206,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       await _loadDeviceDetails();
       await _refreshPackages();
     } catch (e) {
-      setState(() => _adbError = e.toString());
+      setState(() => _adbError = e is StateError ? e.message : e.toString());
     } finally {
       if (mounted) setState(() => _scanning = false);
     }
@@ -240,7 +218,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     if (stem.isEmpty) return;
 
     final ext = p.extension(row.file.path).toLowerCase();
-    if (ext != '.apk' && ext != '.xapk') return;
+    if (!_installableExtensions.contains(ext)) return;
 
     File targetForStem(String baseStem) {
       final dir = row.file.parent;
@@ -289,16 +267,16 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     final files = dir
         .listSync()
         .whereType<File>()
-        .where((f) {
-          final e = p.extension(f.path).toLowerCase();
-          return e == '.apk' || e == '.xapk';
-        })
+        .where((f) => _isInstallable(f.path))
         .toList()
       ..sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
 
     final rows = files.map(_LocalRow.new).toList();
+    if (!mounted) return;
     setState(() {
       _rows = rows;
+      final paths = rows.map((r) => r.path).toSet();
+      _selected.removeWhere((x) => !paths.contains(x));
     });
 
     await _loadLibraryRowsMeta(rows);
@@ -307,15 +285,21 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
   }
 
   Future<void> _loadLibraryRowsMeta(List<_LocalRow> rows) async {
-    final n = rows.length;
-    for (var i = 0; i < n; i += _metaConcurrency) {
-      final end = math.min(i + _metaConcurrency, n);
-      final slice = rows.sublist(i, end);
-      await Future.wait([
-        for (final row in slice) _loadLibraryRowMeta(row),
-      ]);
-      if (mounted) setState(() {});
+    // Worker pool: a slow XAPK no longer holds up the whole batch behind it.
+    var next = 0;
+    var sinceRepaint = 0;
+    Future<void> worker() async {
+      while (next < rows.length) {
+        final row = rows[next++];
+        await _loadLibraryRowMeta(row);
+        if (++sinceRepaint >= _metaConcurrency && mounted) {
+          sinceRepaint = 0;
+          setState(() {});
+        }
+      }
     }
+
+    await Future.wait([for (var i = 0; i < _metaConcurrency; i++) worker()]);
   }
 
   Future<void> _loadLibraryRowMeta(_LocalRow row) async {
@@ -356,19 +340,26 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
 
   Future<void> _loadMeta(_LocalRow row) async {
     row.metaBusy = true;
-    row.isXapk = XapkService.looksLikeXapk(row.path);
+    final ext = p.extension(row.path).toLowerCase();
+    row.isXapk = ext == '.xapk' || ext == '.apks';
     try {
       if (row.isXapk) {
         final peek = await _xapk.peek(row.path);
         row.packageId = peek.packageName;
         row.localVersion = peek.versionName;
         row.title = row.displayName;
-        if (peek.sampleApkArchiveFile != null) {
-          final tmp = File(p.join(Directory.systemTemp.path, 'adb_mgr_icon_${row.packageId ?? 'x'}.apk'));
-          await tmp.writeAsBytes(peek.sampleApkArchiveFile!.content as List<int>);
-          row.badging = await _aapt.readBadging(tmp.path);
-          row.icon = await _aapt.readLauncherIconBytes(tmp.path);
-          await tmp.delete();
+        final sample = peek.sampleApkEntry;
+        if (sample != null && peek.zip != null) {
+          // Unpack only the base APK (not the whole XAPK) so aapt can read its label and icon.
+          final tmpDir = await Directory.systemTemp.createTemp('hk_peek_');
+          try {
+            final tmp = p.join(tmpDir.path, 'base.apk');
+            await peek.zip!.extractTo(sample, tmp);
+            row.badging = await _aapt.readBadging(tmp);
+            row.icon = await _aapt.readLauncherIconBytes(tmp, badging: row.badging);
+          } finally {
+            await tmpDir.delete(recursive: true);
+          }
           if (row.badging != null) {
             row.packageId = row.badging!.packageName;
             row.localVersion = row.badging!.versionName ?? row.localVersion;
@@ -381,7 +372,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
         row.packageId = row.badging?.packageName;
         row.localVersion = row.badging?.versionName;
         row.title = row.badging?.label ?? row.badging?.packageName ?? row.displayName;
-        row.icon = await _aapt.readLauncherIconBytes(row.file.path);
+        row.icon = await _aapt.readLauncherIconBytes(row.file.path, badging: row.badging);
         await _renameRowToSanitizedApplicationLabel(row);
       }
     } catch (e) {
@@ -391,20 +382,21 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     }
   }
 
-  Future<void> _refreshDeviceVersions() async {
+  /// One adb round-trip for the whole library (was two adb calls per row).
+  Future<void> _refreshDeviceVersions({List<_LocalRow>? only}) async {
     final serial = _serial;
     if (serial == null) return;
-    for (final row in _rows) {
-      final pkg = row.packageId;
-      if (pkg == null) continue;
-      final ins = await _adb.isPackageInstalled(serial, pkg);
-      row.installed = ins;
-      if (ins) {
-        row.deviceVersion = await _adb.installedVersionName(serial, pkg);
-      } else {
-        row.deviceVersion = null;
+    final rows = (only ?? _rows).where((r) => r.packageId != null).toList();
+    if (rows.isEmpty) return;
+    try {
+      final versions = await _adb.installedVersionNames(serial, rows.map((r) => r.packageId!));
+      for (final row in rows) {
+        if (!versions.containsKey(row.packageId)) continue;
+        final v = versions[row.packageId];
+        row.installed = v != null;
+        row.deviceVersion = v;
       }
-    }
+    } catch (_) {}
     if (mounted) setState(() {});
   }
 
@@ -510,148 +502,95 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     }
   }
 
-  Future<void> _acquireInstallSlot() async {
-    while (_parallelInstallCount >= _maxConcurrentInstalls && mounted) {
-      await Future<void>.delayed(const Duration(milliseconds: 120));
-    }
-    _parallelInstallCount++;
-  }
-
-  void _releaseInstallSlot() {
-    if (_parallelInstallCount > 0) _parallelInstallCount--;
-  }
-
-  Future<void> _runInstallActivity(_InstallActivity act, _LocalRow row, String serial) async {
-    await _acquireInstallSlot();
-    try {
-      if (!mounted) return;
-      late AdbCommandResult result;
-      final parts = await _xapk.resolveAdbInstallParts(
-        row.path,
-        useXapkPipeline: row.isXapk || await XapkService.zipLooksLikeXapkBundle(row.path),
-      );
-      if (parts.length > 1) {
-        result = await _adb.installMultiple(serial: serial, apkPaths: parts);
-      } else if (parts.isEmpty) {
-        throw StateError('Could not resolve APK files to install.');
-      } else {
-        result = await _adb.installApk(serial: serial, apkPath: parts.single);
-      }
-      act.running = false;
-      final multi = parts.length > 1;
-      act.success = result.installSucceeded;
-      act.detail = act.success == true
-          ? (multi ? 'Installed successfully (split / bundle).' : 'Installed successfully.')
-          : (result.combinedOutput.trim().isEmpty
-              ? 'Install failed (exit code ${result.exitCode}).'
-              : result.combinedOutput.trim());
-    } catch (e) {
-      act.running = false;
-      act.success = false;
-      act.detail = e.toString();
-    } finally {
-      _releaseInstallSlot();
-    }
-    if (mounted) setState(() {});
-    await _refreshDeviceVersions();
-  }
-
-  void _install(_LocalRow row) {
+  void _onJobFinished(InstallJob job) {
+    if (!mounted || !job.targets.any((t) => t.stage == InstallStage.done)) return;
     final serial = _serial;
-    if (serial == null) {
-      _toast('Connect a device and scan first.');
+    if (serial == null || !job.targets.any((t) => t.serial == serial)) return;
+    final rows = _rows.where((r) =>
+        r.path == job.sourcePath || (job.packageName != null && r.packageId == job.packageName));
+    unawaited(_refreshDeviceVersions(only: rows.toList()));
+  }
+
+  void _install(Iterable<_LocalRow> rows) {
+    final targets = _targets;
+    if (targets.isEmpty) {
+      _toast('Connect a device with USB debugging, then press Scan.');
       return;
     }
-    final act = _InstallActivity(
-      id: '${DateTime.now().millisecondsSinceEpoch}_${row.path.hashCode}',
-      label: row.title ?? row.displayName,
-      filePath: row.path,
-    );
-    setState(() {
-      _installActivities.insert(0, act);
-      while (_installActivities.length > _maxActivityRows) {
-        _installActivities.removeLast();
+    for (final row in rows) {
+      _queue.enqueue(sourcePath: row.path, label: row.label, devices: targets);
+    }
+    setState(() => _selected.clear());
+  }
+
+  Future<void> _installExternalFiles(List<String> paths) async {
+    final files = <String>[];
+    for (final path in paths) {
+      if (await FileSystemEntity.isDirectory(path)) {
+        await for (final e in Directory(path).list(recursive: true, followLinks: false)) {
+          if (e is File && _isInstallable(e.path)) files.add(e.path);
+        }
+      } else if (_isInstallable(path)) {
+        files.add(path);
       }
-    });
-    unawaited(_runInstallActivity(act, row, serial));
-  }
+    }
+    if (files.isEmpty) {
+      _toast('Drop .apk, .xapk or .apks files (or a folder containing them).');
+      return;
+    }
+    final libDir = await AppPaths.apkDownloadDirectory();
+    final outside = files.where((f) => !p.isWithin(libDir.path, f)).toList();
 
-  void _clearInstallActivities() {
-    setState(() => _installActivities.removeWhere((e) => !e.running));
-  }
-
-  Widget _buildInstallSummaryBar(BuildContext context) {
-    if (_installActivities.isEmpty) return const SizedBox.shrink();
-    final theme = Theme.of(context);
-    final running = _installActivities.where((a) => a.running).length;
-    return Padding(
-      padding: const EdgeInsets.only(top: 6, bottom: 4),
-      child: Align(
-        alignment: Alignment.centerLeft,
-        child: Text(
-          running > 0
-              ? '$running installing · up to $_maxConcurrentInstalls at once'
-              : '${_installActivities.length} recent install(s)',
-          style: theme.textTheme.labelMedium?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-        ),
+    if (_targets.isEmpty) {
+      // Nothing to install to — keep them for later instead.
+      await _copyIntoLibrary(outside);
+      return;
+    }
+    final targets = _targets;
+    for (final f in files) {
+      final row = _rows.firstWhereOrNull((r) => r.path == f);
+      _queue.enqueue(sourcePath: f, label: row?.label ?? p.basename(f), devices: targets);
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text('Installing ${files.length} ${files.length == 1 ? 'file' : 'files'} '
+            'on ${targets.length == 1 ? targets.single.shortLabel : '${targets.length} devices'}'),
+        action: outside.isEmpty
+            ? null
+            : SnackBarAction(label: 'Also add to library', onPressed: () => _copyIntoLibrary(outside)),
       ),
     );
   }
 
-  Widget _buildActivitiesUnderRow(BuildContext context, _LocalRow row) {
-    final forPath = _installActivities.where((a) => a.filePath == row.path).toList();
-    if (forPath.isEmpty) return const SizedBox.shrink();
-    return Padding(
-      padding: const EdgeInsets.only(top: 14),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          for (var i = 0; i < forPath.length; i++) ...[
-            if (i > 0) const SizedBox(height: 10),
-            _buildSingleInstallActivity(context, forPath[i]),
-          ],
-        ],
-      ),
-    );
+  Future<void> _copyIntoLibrary(List<String> files) async {
+    if (files.isEmpty) return;
+    final dir = await AppPaths.apkDownloadDirectory();
+    var copied = 0;
+    for (final f in files) {
+      try {
+        var dest = File(p.join(dir.path, p.basename(f)));
+        for (var i = 2; dest.existsSync(); i++) {
+          dest = File(p.join(dir.path, '${p.basenameWithoutExtension(f)} ($i)${p.extension(f)}'));
+        }
+        await File(f).copy(dest.path);
+        copied++;
+      } catch (e) {
+        _toast('Could not copy ${p.basename(f)}: $e');
+      }
+    }
+    if (copied > 0) {
+      _toast('Added $copied ${copied == 1 ? 'file' : 'files'} to the library.');
+      await _refreshPackages();
+    }
   }
 
-  Widget _buildSingleInstallActivity(BuildContext context, _InstallActivity a) {
-    final theme = Theme.of(context);
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        if (a.running) ...[
-          Text('Installing…', style: theme.textTheme.labelSmall?.copyWith(color: theme.colorScheme.onSurfaceVariant)),
-          const SizedBox(height: 6),
-          const LinearProgressIndicator(minHeight: 4),
-        ],
-        if (!a.running && a.success != null) ...[
-          DecoratedBox(
-            decoration: BoxDecoration(
-              color: a.success!
-                  ? Colors.green.shade50
-                  : theme.colorScheme.errorContainer.withValues(alpha: 0.35),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(
-                color: a.success! ? Colors.green.shade700 : theme.colorScheme.error,
-                width: 1.2,
-              ),
-            ),
-            child: Padding(
-              padding: const EdgeInsets.all(10),
-              child: SelectableText(
-                a.detail,
-                style: TextStyle(
-                  color: a.success! ? Colors.green.shade900 : theme.colorScheme.error,
-                  fontWeight: FontWeight.w500,
-                  height: 1.35,
-                ),
-              ),
-            ),
-          ),
-        ],
-      ],
-    );
+  Future<void> _pickFilesToInstall() async {
+    final files = await openFiles(acceptedTypeGroups: const [
+      XTypeGroup(label: 'Android packages', extensions: ['apk', 'xapk', 'apks']),
+    ]);
+    if (files.isEmpty) return;
+    await _installExternalFiles([for (final f in files) f.path]);
   }
 
   void _toast(String msg) {
@@ -661,456 +600,632 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
 
   @override
   Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final visible = _filteredLibraryRows;
+    final allVisibleSelected = visible.isNotEmpty && visible.every((r) => _selected.contains(r.path));
     return Scaffold(
       appBar: BrandedAppBar(
-        title: const Text('HK Apps Tool'),
+        title: const Text('Install'),
         actions: [
           TextButton.icon(
-            onPressed: _scanning ? null : _scanDevices,
-            icon: _scanning
-                ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
-                : const Icon(Icons.refresh_rounded, size: 20),
-            label: const Text('Scan device'),
+            onPressed: _pickFilesToInstall,
+            icon: const Icon(Icons.add_rounded, size: 20),
+            label: const Text('Install files…'),
           ),
           TextButton.icon(
             onPressed: _openApkFolder,
             icon: const Icon(Icons.folder_outlined, size: 20),
             label: const Text('Open folder'),
           ),
-          TextButton.icon(
+          IconButton(
+            tooltip: 'Reload library',
             onPressed: _refreshPackages,
             icon: const Icon(Icons.sync_rounded, size: 20),
-            label: const Text('Reload'),
-          ),
-          TextButton.icon(
-            onPressed: _installActivities.any((a) => !a.running) ? _clearInstallActivities : null,
-            icon: const Icon(Icons.clear_all_rounded, size: 20),
-            label: const Text('Clear finished'),
           ),
           const SizedBox(width: 8),
         ],
       ),
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Expanded(
-            child: Padding(
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 12),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Material(
-                    color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.42),
-                    borderRadius: BorderRadius.circular(10),
-                    clipBehavior: Clip.antiAlias,
-                    child: ExpansionTile(
-                      initiallyExpanded: false,
-                      tilePadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                      childrenPadding: const EdgeInsets.fromLTRB(10, 0, 10, 8),
-                      title: Row(
-                        children: [
-                          Icon(Icons.folder_special_outlined,
-                              size: 20, color: Theme.of(context).colorScheme.primary),
-                          const SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              _libraryFolderExpansionTitle(),
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .titleSmall
-                                  ?.copyWith(fontWeight: FontWeight.w700),
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
-                      subtitle: Padding(
-                        padding: const EdgeInsets.only(top: 4),
-                        child: Text(
-                          _libraryHeaderSubtitle(),
-                          style:
-                              Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54),
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      children: [
-                        if (_adbError != null) ...[
-                          Card(
-                            margin: EdgeInsets.zero,
-                            color: Theme.of(context).colorScheme.errorContainer,
-                            child: Padding(
-                              padding: const EdgeInsets.all(10),
-                              child: Text(
-                                _adbError!,
-                                style: TextStyle(
-                                  fontSize: 13,
-                                  color: Theme.of(context).colorScheme.onErrorContainer,
-                                ),
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                        ],
-                        if (_devices.isNotEmpty) ...[
-                          Card(
-                            margin: EdgeInsets.zero,
-                            child: Padding(
-                              padding: const EdgeInsets.all(10),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.stretch,
-                                children: [
-                                  Text(
-                                    'Install target',
-                                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                        ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  if (_devices.length > 1)
-                                    InputDecorator(
-                                      decoration: const InputDecoration(
-                                        border: OutlineInputBorder(),
-                                        isDense: true,
-                                        contentPadding:
-                                            EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                                      ),
-                                      child: DropdownButtonHideUnderline(
-                                        child: DropdownButton<String>(
-                                          isDense: true,
-                                          isExpanded: true,
-                                          value: _serial,
-                                          hint: const Text('Select device'),
-                                          items: [
-                                            for (final d in _devices)
-                                              DropdownMenuItem(
-                                                value: d.serial,
-                                                child: Text(d.shortLabel,
-                                                    overflow: TextOverflow.ellipsis),
-                                              ),
-                                          ],
-                                          onChanged: (v) async {
-                                            if (v == null) return;
-                                            setState(() => _serial = v);
-                                            await _loadDeviceDetails();
-                                            await _refreshDeviceVersions();
-                                          },
-                                        ),
-                                      ),
-                                    )
-                                  else
-                                    Text(
-                                      _devices.first.shortLabel,
-                                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                            fontWeight: FontWeight.w600,
-                                          ),
-                                    ),
-                                ],
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 8),
-                        ],
-                        Text(
-                          _devices.isEmpty
-                              ? 'Enable USB debugging, then Scan device in the app bar.'
-                              : 'Installation uses the selected device above.',
-                          style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                                color: Colors.black54,
-                                height: 1.35,
-                              ),
-                        ),
-                        const SizedBox(height: 6),
-                        ListenableBuilder(
-                          listenable: AppPaths.apkLibraryDirectoryListenable,
-                          builder: (context, _) {
-                            return FutureBuilder<(Directory, bool)>(
-                              key: ValueKey(AppPaths.apkLibraryDirectoryListenable.value),
-                              future: () async {
-                                final d = await AppPaths.apkDownloadDirectory();
-                                final custom = await AppPaths.isUsingCustomApkLibraryDirectory();
-                                return (d, custom);
-                              }(),
-                              builder: (context, snap) {
-                                if (!snap.hasData) {
-                                  return const Padding(
-                                    padding: EdgeInsets.symmetric(vertical: 4),
-                                    child: LinearProgressIndicator(minHeight: 2),
-                                  );
-                                }
-                                final pack = snap.data!;
-                                final dir = pack.$1;
-                                final isCustom = pack.$2;
-                                return Column(
-                                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                                  children: [
-                                    if (isCustom)
-                                      Padding(
-                                        padding: const EdgeInsets.only(bottom: 6),
-                                        child: Text(
-                                          'Custom APK / XAPK library folder',
-                                          style: Theme.of(context).textTheme.labelMedium?.copyWith(
-                                                color: Theme.of(context).colorScheme.primary,
-                                                fontWeight: FontWeight.w600,
-                                              ),
-                                        ),
-                                      ),
-                                    Text(
-                                      dir.path,
-                                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                            color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                            fontSize: 11,
-                                          ),
-                                      maxLines: 3,
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                    const SizedBox(height: 8),
-                                    Wrap(
-                                      spacing: 8,
-                                      runSpacing: 4,
-                                      children: [
-                                        TextButton.icon(
-                                          onPressed: _pickApkLibraryFolder,
-                                          icon: const Icon(Icons.folder_open_outlined, size: 18),
-                                          label: const Text('Choose library folder'),
-                                        ),
-                                        if (isCustom)
-                                          TextButton(
-                                            onPressed: _resetApkLibraryFolder,
-                                            child: const Text('Use default folder'),
-                                          ),
-                                      ],
-                                    ),
-                                  ],
-                                );
-                              },
-                            );
-                          },
-                        ),
-                        _buildInstallSummaryBar(context),
-                        if (_deviceProps != null) ...[
-                          const SizedBox(height: 8),
-                          Card(
-                            margin: EdgeInsets.zero,
-                            child: Padding(
-                              padding: const EdgeInsets.all(10),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Text(
-                                    'Device info',
-                                    style: Theme.of(context).textTheme.labelLarge?.copyWith(
-                                          color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                        ),
-                                  ),
-                                  const SizedBox(height: 6),
-                                  Text(
-                                    [
-                                      if ((_deviceProps!['manufacturer'] ?? '').isNotEmpty)
-                                        _deviceProps!['manufacturer']!,
-                                      if ((_deviceProps!['model'] ?? '').isNotEmpty)
-                                        _deviceProps!['model']!,
-                                    ].join(' '),
-                                    style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                                          fontWeight: FontWeight.w600,
-                                        ),
-                                  ),
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    'Android ${_deviceProps!['android'] ?? '?'} · API ${_deviceProps!['sdk'] ?? '?'}',
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodySmall
-                                        ?.copyWith(color: Colors.black54),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ],
-                      ],
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-                  if (_rows.isNotEmpty) ...[
-                    TextField(
-                      controller: _librarySearchCtl,
-                      decoration: InputDecoration(
-                        hintText: 'Search APK / XAPK library…',
-                        prefixIcon: const Icon(Icons.search_rounded),
-                        suffixIcon: _librarySearchCtl.text.isEmpty
-                            ? null
-                            : IconButton(
-                                tooltip: 'Clear',
-                                onPressed: () => _librarySearchCtl.clear(),
-                                icon: const Icon(Icons.clear_rounded),
-                              ),
-                        border: const OutlineInputBorder(),
-                        isDense: true,
-                      ),
-                    ),
+      bottomNavigationBar: _selected.isEmpty ? null : _buildSelectionBar(context),
+      body: DropTarget(
+        onDragEntered: (_) => setState(() => _dragging = true),
+        onDragExited: (_) => setState(() => _dragging = false),
+        onDragDone: (d) {
+          setState(() => _dragging = false);
+          _installExternalFiles([for (final f in d.files) f.path]);
+        },
+        child: Stack(
+          children: [
+            LayoutBuilder(
+              builder: (context, box) {
+                final wide = box.maxWidth >= 1080;
+                final showQueue = _queue.jobs.isNotEmpty || wide;
+                final main = Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    _buildDeviceBar(context),
                     const SizedBox(height: 10),
-                  ],
-                  Expanded(
-                    child: _rows.isEmpty
-                        ? Center(
-                            child: Text(
-                              'No APK or XAPK yet.\nUse Search & download to add files.',
-                              textAlign: TextAlign.center,
-                              style: Theme.of(context)
-                                  .textTheme
-                                  .bodyMedium
-                                  ?.copyWith(color: Colors.black54),
-                            ),
-                          )
-                        : _filteredLibraryRows.isEmpty
-                            ? Center(
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 24),
-                                  child: Text(
-                                    'No library entries match "${_librarySearchCtl.text.trim()}".',
-                                    textAlign: TextAlign.center,
-                                    style: Theme.of(context)
-                                        .textTheme
-                                        .bodyMedium
-                                        ?.copyWith(color: Colors.black54),
-                                  ),
-                                ),
-                              )
-                            : ListView.separated(
-                                itemCount: _filteredLibraryRows.length,
-                                separatorBuilder: (context, i) => const SizedBox(height: 10),
-                                itemBuilder: (context, i) =>
-                                    _buildCard(context, _filteredLibraryRows[i]),
+                    _buildLibraryBar(context),
+                    const SizedBox(height: 10),
+                    if (_rows.isNotEmpty) ...[
+                      Row(
+                        children: [
+                          Expanded(
+                            child: TextField(
+                              controller: _librarySearchCtl,
+                              decoration: InputDecoration(
+                                hintText: 'Search ${_rows.length} apps by name, package or file…',
+                                prefixIcon: const Icon(Icons.search_rounded),
+                                suffixIcon: _librarySearchCtl.text.isEmpty
+                                    ? null
+                                    : IconButton(
+                                        tooltip: 'Clear',
+                                        onPressed: () => _librarySearchCtl.clear(),
+                                        icon: const Icon(Icons.clear_rounded),
+                                      ),
+                                isDense: true,
                               ),
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          TextButton.icon(
+                            onPressed: visible.isEmpty
+                                ? null
+                                : () => setState(() {
+                                      if (allVisibleSelected) {
+                                        _selected.removeAll(visible.map((r) => r.path));
+                                      } else {
+                                        _selected.addAll(visible.map((r) => r.path));
+                                      }
+                                    }),
+                            icon: Icon(allVisibleSelected ? Icons.deselect_rounded : Icons.select_all_rounded),
+                            label: Text(allVisibleSelected ? 'Deselect' : 'Select all'),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 10),
+                    ],
+                    if (!wide && _queue.jobs.isNotEmpty) ...[
+                      const InstallQueuePanel(maxHeight: 220),
+                      const SizedBox(height: 10),
+                    ],
+                    Expanded(child: _buildLibraryList(context, visible)),
+                  ],
+                );
+                return Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 16),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Expanded(child: main),
+                      if (wide && showQueue) ...[
+                        const SizedBox(width: 16),
+                        const SizedBox(width: 360, child: InstallQueuePanel()),
+                      ],
+                    ],
                   ),
-                ],
-              ),
+                );
+              },
             ),
-          ),
-        ],
+            if (_dragging)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: Container(
+                    margin: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: scheme.primaryContainer.withValues(alpha: 0.88),
+                      borderRadius: BorderRadius.circular(24),
+                      border: Border.all(color: scheme.primary, width: 2.5),
+                    ),
+                    child: Center(
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.file_download_rounded, size: 56, color: scheme.onPrimaryContainer),
+                          const SizedBox(height: 12),
+                          Text(
+                            _targets.isEmpty ? 'Drop to add to your library' : 'Drop to install',
+                            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                                  color: scheme.onPrimaryContainer,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'APK, XAPK, APKS, or a folder of them',
+                            style: TextStyle(color: scheme.onPrimaryContainer),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }
 
-  Widget _buildCard(BuildContext context, _LocalRow row) {
+  Widget _buildSelectionBar(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final n = _selected.length;
+    final targets = _targets;
+    return Material(
+      color: scheme.surfaceContainerHigh,
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 10, 16, 10),
+          child: Row(
+            children: [
+              Text('$n selected', style: Theme.of(context).textTheme.titleSmall),
+              const SizedBox(width: 12),
+              TextButton(onPressed: () => setState(_selected.clear), child: const Text('Clear')),
+              const Spacer(),
+              if (targets.length > 1)
+                Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Text('on ${targets.length} devices',
+                      style: TextStyle(color: scheme.onSurfaceVariant)),
+                ),
+              FilledButton.icon(
+                onPressed: targets.isEmpty
+                    ? null
+                    : () => _install(_rows.where((r) => _selected.contains(r.path) && !r.metaBusy)),
+                icon: const Icon(Icons.install_mobile_rounded, size: 20),
+                label: Text('Install $n'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeviceBar(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
     final t = Theme.of(context).textTheme;
+    final props = _deviceProps;
+    final current = _devices.firstWhereOrNull((d) => d.serial == _serial);
+    final subtitle = _devices.isEmpty
+        ? 'Connect a phone with USB debugging enabled, then press Scan.'
+        : [
+            if (props != null)
+              [props['manufacturer'], props['model']].where((e) => (e ?? '').isNotEmpty).join(' '),
+            if (props != null && (props['android'] ?? '').isNotEmpty)
+              'Android ${props['android']} · API ${props['sdk']}',
+            if (props == null && current != null) current.shortLabel,
+          ].join(' · ');
     return Card(
       child: Padding(
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(12),
-                  child: row.icon != null
-                      ? Image.memory(row.icon!, width: 56, height: 56, fit: BoxFit.cover)
-                      : Container(
-                          width: 56,
-                          height: 56,
-                          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                          child: Icon(row.isXapk ? Icons.layers_outlined : Icons.android_rounded),
-                        ),
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(
+                    color: _devices.isEmpty ? scheme.surfaceContainerHighest : scheme.primaryContainer,
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Icon(
+                    _devices.isEmpty ? Icons.phonelink_off_rounded : Icons.smartphone_rounded,
+                    color: _devices.isEmpty ? scheme.onSurfaceVariant : scheme.onPrimaryContainer,
+                  ),
                 ),
-                const SizedBox(width: 16),
+                const SizedBox(width: 14),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        row.badging?.label ?? row.title ?? row.displayName,
-                        style: t.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                        _devices.isEmpty
+                            ? 'No device connected'
+                            : _devices.length == 1
+                                ? 'Installing to ${_devices.single.shortLabel}'
+                                : '${_devices.length} devices connected',
+                        style: t.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      if (row.localVersion != null && row.localVersion!.trim().isNotEmpty) ...[
-                        const SizedBox(height: 2),
-                        Text(
-                          'v${row.localVersion}',
-                          style: t.bodyMedium?.copyWith(fontWeight: FontWeight.w500, color: Theme.of(context).colorScheme.primary),
-                        ),
-                      ],
-                      if (row.packageId != null && row.packageId!.trim().isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          row.packageId!,
-                          style: t.labelSmall?.copyWith(
-                            color: Theme.of(context).colorScheme.onSurfaceVariant,
-                            fontFamily: 'monospace',
-                          ),
-                        ),
-                      ],
-                      const SizedBox(height: 4),
+                      const SizedBox(height: 2),
                       Text(
-                        [
-                          row.displayName,
-                          if (row.isXapk) 'XAPK',
-                        ].join(' · '),
-                        style: t.labelSmall?.copyWith(color: Theme.of(context).colorScheme.outline),
+                        subtitle,
+                        style: t.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                       ),
-                      if (row.installed != null) ...[
-                        const SizedBox(height: 6),
-                        Text(
-                          row.installed!
-                              ? 'On device: v${row.deviceVersion ?? '?'}'
-                              : 'Not installed on device',
-                          style: t.labelMedium,
-                        ),
-                      ],
-                      if (row.remoteVersion != null) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          'Online: v${row.remoteVersion}'
-                          '${row.updateAvailable == true ? ' (newer)' : row.updateAvailable == false ? ' (same or older)' : ''}',
-                          style: t.labelMedium?.copyWith(color: Theme.of(context).colorScheme.primary),
-                        ),
-                      ],
                     ],
                   ),
                 ),
-                const SizedBox(width: 12),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  alignment: WrapAlignment.end,
-                  children: [
-                    FilledButton(
-                      onPressed: row.metaBusy ? null : () => _install(row),
-                      child: const Text('Install'),
-                    ),
-                    OutlinedButton(
-                      onPressed: row.checkBusy ? null : () => _checkOnline(row),
-                      child: row.checkBusy
-                          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
-                          : const Text('Check update'),
-                    ),
-                    if (row.updateAvailable == true && row.updateRelease != null)
-                      FilledButton.tonal(
-                        onPressed: row.downloadUpdateBusy ? null : () => _downloadNewerVersion(row),
-                        child: row.downloadUpdateBusy
-                            ? const SizedBox(
-                                width: 18,
-                                height: 18,
-                                child: CircularProgressIndicator(strokeWidth: 2),
-                              )
-                            : const Text('Download newer'),
+                Tooltip(
+                  message: 'Also copy OBB game data from XAPKs to the device',
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('OBB data', style: t.labelMedium?.copyWith(color: scheme.onSurfaceVariant)),
+                      const SizedBox(width: 4),
+                      ListenableBuilder(
+                        listenable: _queue,
+                        builder: (context, _) => Switch(
+                          value: _queue.copyObb,
+                          onChanged: (v) => _queue.setCopyObb(v),
+                        ),
                       ),
-                    
-                    OutlinedButton(
-                      onPressed: row.metaBusy ? null : () => _deleteLocalFile(row),
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: Theme.of(context).colorScheme.error,
-                      ),
-                      child: const Text('Delete file'),
-                    ),
-                  ],
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                FilledButton.tonalIcon(
+                  onPressed: _scanning ? null : _scanDevices,
+                  icon: _scanning
+                      ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                      : const Icon(Icons.usb_rounded, size: 20),
+                  label: const Text('Scan'),
                 ),
               ],
             ),
-            _buildActivitiesUnderRow(context, row),
+            if (_devices.length > 1) ...[
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 6,
+                children: [
+                  for (final d in _devices)
+                    ChoiceChip(
+                      label: Text(d.shortLabel),
+                      selected: !_allDevices && d.serial == _serial,
+                      onSelected: (_) async {
+                        setState(() {
+                          _allDevices = false;
+                          _serial = d.serial;
+                        });
+                        await _loadDeviceDetails();
+                        await _refreshDeviceVersions();
+                      },
+                    ),
+                  ChoiceChip(
+                    avatar: const Icon(Icons.devices_rounded, size: 18),
+                    label: Text('All ${_devices.length} devices'),
+                    selected: _allDevices,
+                    onSelected: (_) => setState(() => _allDevices = true),
+                  ),
+                ],
+              ),
+            ],
+            if (_adbError != null) ...[
+              const SizedBox(height: 10),
+              DecoratedBox(
+                decoration: BoxDecoration(
+                  color: scheme.errorContainer,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(10),
+                  child: SelectableText(
+                    _adbError!,
+                    style: TextStyle(fontSize: 13, color: scheme.onErrorContainer),
+                  ),
+                ),
+              ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildLibraryBar(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final t = Theme.of(context).textTheme;
+    return ListenableBuilder(
+      listenable: AppPaths.apkLibraryDirectoryListenable,
+      builder: (context, _) {
+        return FutureBuilder<(Directory, bool)>(
+          key: ValueKey(AppPaths.apkLibraryDirectoryListenable.value),
+          future: () async {
+            final d = await AppPaths.apkDownloadDirectory();
+            final custom = await AppPaths.isUsingCustomApkLibraryDirectory();
+            return (d, custom);
+          }(),
+          builder: (context, snap) {
+            final dir = snap.data?.$1;
+            final isCustom = snap.data?.$2 ?? false;
+            return Row(
+              children: [
+                Icon(Icons.folder_special_rounded, size: 20, color: scheme.primary),
+                const SizedBox(width: 8),
+                Text(
+                  isCustom ? 'Library (custom)' : 'Library',
+                  style: t.labelLarge?.copyWith(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    dir?.path ?? '…',
+                    style: t.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                TextButton(onPressed: _pickApkLibraryFolder, child: const Text('Change…')),
+                if (isCustom) TextButton(onPressed: _resetApkLibraryFolder, child: const Text('Use default')),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _buildLibraryList(BuildContext context, List<_LocalRow> visible) {
+    final scheme = Theme.of(context).colorScheme;
+    final t = Theme.of(context).textTheme;
+    if (_rows.isEmpty) {
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.inventory_2_outlined, size: 56, color: scheme.primary.withValues(alpha: 0.7)),
+            const SizedBox(height: 14),
+            Text('Your library is empty', style: t.titleMedium?.copyWith(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 6),
+            Text(
+              'Drop APK or XAPK files here, use Install files…, or grab apps from Search.',
+              textAlign: TextAlign.center,
+              style: t.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      );
+    }
+    if (visible.isEmpty) {
+      return Center(
+        child: Text(
+          'No library entries match "${_librarySearchCtl.text.trim()}".',
+          textAlign: TextAlign.center,
+          style: t.bodyMedium?.copyWith(color: scheme.onSurfaceVariant),
+        ),
+      );
+    }
+    return ListenableBuilder(
+      listenable: _queue,
+      builder: (context, _) => ListView.separated(
+        itemCount: visible.length,
+        separatorBuilder: (context, i) => const SizedBox(height: 8),
+        itemBuilder: (context, i) => _buildCard(context, visible[i]),
+      ),
+    );
+  }
+
+  Widget _chip(BuildContext context, String text, {Color? bg, Color? fg, IconData? icon}) {
+    final scheme = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: bg ?? scheme.surfaceContainerHigh,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, size: 13, color: fg ?? scheme.onSurfaceVariant),
+              const SizedBox(width: 4),
+            ],
+            Text(
+              text,
+              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: fg ?? scheme.onSurfaceVariant,
+                    fontWeight: FontWeight.w600,
+                  ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCard(BuildContext context, _LocalRow row) {
+    final scheme = Theme.of(context).colorScheme;
+    final t = Theme.of(context).textTheme;
+    final job = _queue.latestFor(row.path);
+    final busy = job != null && !job.finished;
+    final selected = _selected.contains(row.path);
+    final sameAsDevice = row.installed == true &&
+        row.deviceVersion != null &&
+        row.localVersion != null &&
+        row.deviceVersion == row.localVersion;
+
+    return Card(
+      color: selected ? scheme.primaryContainer.withValues(alpha: 0.35) : null,
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: () => setState(() => selected ? _selected.remove(row.path) : _selected.add(row.path)),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(6, 10, 12, 10),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Checkbox(
+                    value: selected,
+                    onChanged: (v) => setState(() => v == true ? _selected.add(row.path) : _selected.remove(row.path)),
+                  ),
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(12),
+                    child: row.icon != null
+                        ? Image.memory(row.icon!, width: 48, height: 48, fit: BoxFit.cover, gaplessPlayback: true)
+                        : Container(
+                            width: 48,
+                            height: 48,
+                            color: scheme.surfaceContainerHighest,
+                            child: row.metaBusy
+                                ? const Padding(
+                                    padding: EdgeInsets.all(14),
+                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                  )
+                                : Icon(row.isXapk ? Icons.layers_outlined : Icons.android_rounded,
+                                    color: scheme.onSurfaceVariant),
+                          ),
+                  ),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          row.label,
+                          style: t.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          [
+                            if (row.packageId != null && row.packageId!.trim().isNotEmpty) row.packageId!,
+                            row.displayName,
+                          ].join(' · '),
+                          style: t.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 4,
+                          children: [
+                            if (row.localVersion != null && row.localVersion!.trim().isNotEmpty)
+                              _chip(context, 'v${row.localVersion}',
+                                  bg: scheme.primaryContainer.withValues(alpha: 0.6), fg: scheme.onPrimaryContainer),
+                            if (row.isXapk) _chip(context, 'XAPK', icon: Icons.layers_rounded),
+                            if (row.installed == true)
+                              sameAsDevice
+                                  ? _chip(context, 'Installed', icon: Icons.check_rounded,
+                                      bg: scheme.successContainer, fg: scheme.success)
+                                  : _chip(context, 'On device v${row.deviceVersion ?? '?'}',
+                                      icon: Icons.smartphone_rounded),
+                            if (row.installed == false) _chip(context, 'Not on device'),
+                            if (row.remoteVersion != null)
+                              _chip(
+                                context,
+                                'Store v${row.remoteVersion}${row.updateAvailable == true ? ' · newer' : ''}',
+                                icon: Icons.storefront_rounded,
+                                bg: row.updateAvailable == true ? scheme.tertiaryContainer : null,
+                                fg: row.updateAvailable == true ? scheme.onTertiaryContainer : null,
+                              ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  if (row.updateAvailable == true && row.updateRelease != null) ...[
+                    FilledButton.tonal(
+                      onPressed: row.downloadUpdateBusy ? null : () => _downloadNewerVersion(row),
+                      child: row.downloadUpdateBusy
+                          ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Text('Download newer'),
+                    ),
+                    const SizedBox(width: 8),
+                  ],
+                  FilledButton.icon(
+                    onPressed: row.metaBusy || busy ? null : () => _install([row]),
+                    icon: busy
+                        ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.install_mobile_rounded, size: 18),
+                    label: Text(busy ? stageLabel(job.stage) : 'Install'),
+                  ),
+                  const SizedBox(width: 4),
+                  IconButton(
+                    tooltip: 'Check for update',
+                    onPressed: row.checkBusy ? null : () => _checkOnline(row),
+                    icon: row.checkBusy
+                        ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
+                        : const Icon(Icons.update_rounded),
+                  ),
+                  PopupMenuButton<String>(
+                    tooltip: 'More',
+                    enabled: !row.metaBusy,
+                    onSelected: (v) {
+                      if (v == 'delete') _deleteLocalFile(row);
+                    },
+                    itemBuilder: (c) => [
+                      PopupMenuItem(
+                        value: 'delete',
+                        child: Row(
+                          children: [
+                            Icon(Icons.delete_outline_rounded, color: scheme.error),
+                            const SizedBox(width: 10),
+                            Text('Delete file', style: TextStyle(color: scheme.error)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              if (job != null) _buildJobLine(context, job),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildJobLine(BuildContext context, InstallJob job) {
+    final scheme = Theme.of(context).colorScheme;
+    final t = Theme.of(context).textTheme;
+    final progress = job.progress;
+    if (!job.finished) {
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(48, 10, 4, 0),
+        child: Row(
+          children: [
+            Expanded(
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  minHeight: 5,
+                  value: job.stage == InstallStage.queued ? 0 : progress,
+                ),
+              ),
+            ),
+            const SizedBox(width: 10),
+            Text(
+              '${stageLabel(job.stage)}${progress != null ? ' ${(progress * 100).round()}%' : ''}',
+              style: t.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ),
+      );
+    }
+    if (job.stage == InstallStage.canceled) return const SizedBox.shrink();
+    final ok = job.succeeded;
+    final detail = ok
+        ? '${job.targets.length > 1 ? 'Installed on ${job.targets.length} devices' : job.targets.single.detail}'
+            '${job.elapsed != null ? ' in ${formatDuration(job.elapsed!)}' : ''}'
+        : (job.error ?? 'Install failed');
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(48, 10, 4, 0),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(ok ? Icons.check_circle_rounded : Icons.error_rounded,
+              size: 16, color: ok ? scheme.success : scheme.error),
+          const SizedBox(width: 6),
+          Expanded(
+            child: SelectableText(
+              detail,
+              maxLines: ok ? 1 : 5,
+              style: t.bodySmall?.copyWith(color: ok ? scheme.success : scheme.error, height: 1.3),
+            ),
+          ),
+        ],
       ),
     );
   }

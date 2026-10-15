@@ -9,6 +9,8 @@ import 'package:path/path.dart' as p;
 import 'services/adb_paths.dart';
 import 'services/adb_service.dart';
 import 'services/aapt_service.dart';
+import 'services/apk_installer.dart';
+import 'services/install_queue.dart';
 import 'services/app_paths.dart';
 import 'services/combined_apk_store_service.dart';
 import 'services/download_queue.dart';
@@ -271,20 +273,8 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
       final result = await runWithBlockingProgress<AdbCommandResult>(
         context,
         message: 'Installing ${app.displayName}…',
-        work: () async {
-          final useXapk = XapkService.looksLikeXapk(dest.path) || isXapkUrl;
-          final parts = await _xapk.resolveAdbInstallParts(
-            dest.path,
-            useXapkPipeline: useXapk || await XapkService.zipLooksLikeXapkBundle(dest.path),
-          );
-          if (parts.length > 1) {
-            return _adb.installMultiple(serial: serial, apkPaths: parts);
-          }
-          if (parts.isEmpty) {
-            throw StateError('Could not resolve APK paths to install.');
-          }
-          return _adb.installApk(serial: serial, apkPath: parts.single);
-        },
+        work: () => ApkInstaller(adb: _adb, xapk: _xapk)
+            .installFile(dest.path, serial, includeObb: InstallQueue.instance.copyObb),
       );
       if (!mounted) return;
       showAdbSnack(
@@ -413,7 +403,7 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
                       padding: const EdgeInsets.only(top: 6),
                       child: Text(
                         'Check update uses the same stores as Search & download. When a newer store version exists, you can download and install it in one step.',
-                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Colors.black54),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                       ),
                     ),
                   const SizedBox(height: 12),
@@ -449,7 +439,7 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
                                             const SizedBox(height: 2),
                                             Text(
                                               app.packageName,
-                                              style: t.bodySmall?.copyWith(color: Colors.black54),
+                                              style: t.bodySmall?.copyWith(color: Theme.of(context).colorScheme.onSurfaceVariant),
                                               maxLines: 1,
                                               overflow: TextOverflow.ellipsis,
                                             ),

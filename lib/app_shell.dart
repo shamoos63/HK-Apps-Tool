@@ -9,6 +9,7 @@ import 'local_install_page.dart';
 import 'widgets/branded_app_bar.dart';
 import 'services/combined_apk_store_service.dart';
 import 'services/download_queue.dart';
+import 'services/install_queue.dart';
 
 class AppShell extends StatefulWidget {
   const AppShell({super.key});
@@ -49,6 +50,11 @@ class _AppShellState extends State<AppShell> {
   Widget _railIcon(int index) {
     final iconData = _destinations[index].icon;
     final icon = Icon(iconData);
+    if (index == kShellTabInstall) {
+      final active = InstallQueue.instance.activeCount;
+      if (active <= 0) return icon;
+      return Badge(label: Text('$active'), isLabelVisible: true, child: icon);
+    }
     if (index != kShellTabDownloads) return icon;
     final n = DownloadQueue.instance.activeRunningCount;
     if (n <= 0) return icon;
@@ -70,7 +76,7 @@ class _AppShellState extends State<AppShell> {
     ];
     return Scaffold(
       body: ListenableBuilder(
-        listenable: DownloadQueue.instance,
+        listenable: Listenable.merge([DownloadQueue.instance, InstallQueue.instance]),
         builder: (context, _) {
           return Row(
             children: [
@@ -124,7 +130,11 @@ class _AppShellState extends State<AppShell> {
                     ),
                 ],
               ),
-              const VerticalDivider(width: 1, thickness: 1),
+              VerticalDivider(
+                width: 1,
+                thickness: 1,
+                color: Theme.of(context).colorScheme.outlineVariant.withValues(alpha: 0.5),
+              ),
               Expanded(
                 // Keep each tab's State alive so Search results / text survive tab switches.
                 child: IndexedStack(

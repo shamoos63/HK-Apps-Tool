@@ -5,19 +5,24 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 import 'app_paths.dart';
+import 'zip_index.dart';
 
 class XapkPeek {
   XapkPeek({
     this.packageName,
     this.versionName,
     this.versionCode,
-    this.sampleApkArchiveFile,
+    this.sampleApkEntry,
+    this.zip,
   });
 
   final String? packageName;
   final String? versionName;
   final String? versionCode;
-  final ArchiveFile? sampleApkArchiveFile;
+
+  /// Base APK inside the XAPK (read it with [zip]) — used for badging and the launcher icon.
+  final ZipEntry? sampleApkEntry;
+  final ZipIndex? zip;
 }
 
 class XapkExtractResult {
@@ -25,6 +30,105 @@ class XapkExtractResult {
 
   final List<String> apkPaths;
   final String? packageNameHint;
+}
+
+/// One APK (base or split) to send to the device.
+class InstallPart {
+  InstallPart.localFile(String this.localPath, this.size)
+      : zip = null,
+        entry = null,
+        name = p.basename(localPath);
+
+  InstallPart.zipEntry(ZipIndex this.zip, ZipEntry this.entry)
+      : localPath = null,
+        size = entry.uncompressedSize,
+        name = entry.baseName;
+
+  final String name;
+  final int size;
+  final String? localPath;
+  final ZipIndex? zip;
+  final ZipEntry? entry;
+
+  Future<Stream<List<int>>> open() async {
+    if (localPath != null) return File(localPath!).openRead();
+    return zip!.openEntry(entry!);
+  }
+}
+
+/// OBB expansion file shipped inside an XAPK (copied to `/sdcard/Android/obb/...`).
+class ObbPart {
+  ObbPart(this.zip, this.entry, this.devicePath);
+
+  final ZipIndex zip;
+  final ZipEntry entry;
+  final String devicePath;
+
+  int get size => entry.uncompressedSize;
+}
+
+/// What to install for one library file: either entries streamed straight out of the archive,
+/// or files on disk (plain APK, or the unpacked fallback for odd archives).
+class InstallPlan {
+  InstallPlan({
+    required this.sourcePath,
+    required this.parts,
+    this.obbs = const [],
+    this.packageName,
+    this.workDir,
+  });
+
+  final String sourcePath;
+  final List<InstallPart> parts;
+  final List<ObbPart> obbs;
+  final String? packageName;
+
+  /// Temp folder owned by this plan (only when the archive had to be unpacked).
+  final Directory? workDir;
+
+  bool get isSplit => parts.length > 1;
+  int get apkBytes => parts.fold(0, (a, b) => a + b.size);
+  int get obbBytes => obbs.fold(0, (a, b) => a + b.size);
+
+  /// Paths usable by plain `adb install` / `install-multiple`. Archive entries are copied into a
+  /// private temp folder on first use (fallback path only — the fast path never touches disk).
+  /// Shared by every device installing this plan, so it is unpacked at most once.
+  Future<List<String>> materialize() => _materializing ??= _materialize();
+
+  Future<List<String>>? _materializing;
+
+  Future<List<String>> _materialize() async {
+    if (parts.every((x) => x.localPath != null)) return [for (final x in parts) x.localPath!];
+    final dir = _materializedDir = await AppPaths.newJobExtractDirectory();
+    final out = <String>[];
+    final used = <String>{};
+    for (final part in parts) {
+      if (part.localPath != null) {
+        out.add(part.localPath!);
+        continue;
+      }
+      var name = part.name.replaceAll(RegExp(r'[<>:"|?*\\/]'), '_');
+      if (name.isEmpty || !used.add(name.toLowerCase())) {
+        name = '${out.length}_${name.isEmpty ? 'part.apk' : name}';
+        used.add(name.toLowerCase());
+      }
+      final dest = p.join(dir.path, name);
+      await part.zip!.extractTo(part.entry!, dest);
+      out.add(dest);
+    }
+    return out;
+  }
+
+  Directory? _materializedDir;
+
+  Future<void> dispose() async {
+    for (final d in [workDir, _materializedDir]) {
+      if (d == null) continue;
+      try {
+        if (await d.exists()) await d.delete(recursive: true);
+      } catch (_) {}
+    }
+  }
 }
 
 class _ExtractScan {
@@ -35,7 +139,60 @@ class _ExtractScan {
   final List<String> apkPaths;
 }
 
-/// Expands APKPure-style XAPK archives to a temp directory and returns contained APK paths.
+class _Manifest {
+  _Manifest({this.packageName, this.versionName, this.versionCode, this.splitOrder, this.expansions});
+
+  final String? packageName;
+  final String? versionName;
+  final String? versionCode;
+  final List<String>? splitOrder;
+
+  /// archive entry name → device-relative install path.
+  final Map<String, String>? expansions;
+
+  static _Manifest? parse(List<int> bytes) {
+    try {
+      final map = json.decode(utf8.decode(bytes, allowMalformed: true)) as Map<String, dynamic>;
+      final split = map['split_apks'];
+      final exp = map['expansions'];
+      final expansions = <String, String>{};
+      if (exp is List) {
+        for (final e in exp) {
+          if (e is Map && e['file'] is String) {
+            final file = (e['file'] as String).replaceAll('\\', '/');
+            final dest = (e['install_path'] as String?)?.replaceAll('\\', '/') ?? file;
+            expansions[file] = dest;
+          }
+        }
+      }
+      return _Manifest(
+        packageName: map['package_name'] as String? ?? map['package'] as String?,
+        versionName: map['version_name'] as String? ?? map['name'] as String?,
+        versionCode: map['version_code']?.toString(),
+        splitOrder: split is List
+            ? split
+                .map((e) {
+                  if (e is String) return e;
+                  if (e is Map && e['file'] is String) return e['file'] as String;
+                  return null;
+                })
+                .whereType<String>()
+                .toList()
+            : null,
+        expansions: expansions.isEmpty ? null : expansions,
+      );
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Reads APKPure-style XAPK archives and plans how to install them.
+///
+/// Fast path: list the ZIP central directory and stream each split APK straight out of the
+/// archive to the device — nothing is unpacked to disk and OBB data is never touched unless asked.
+/// Slow path (archives the streaming reader cannot parse): unpack with system `tar` like before,
+/// but into a private per-job folder so several installs can run at the same time.
 class XapkService {
   /// System `tar` (Windows ships bsdtar in System32 — reads ZIP/APK/XAPK reliably).
   /// The `archive` [ZipDecoder] throws [RangeError] on some legitimate store-downloaded XAPKs.
@@ -83,52 +240,43 @@ class XapkService {
   static Future<_ExtractScan> _scanExtractedFolder(Directory dir) async {
     String? pkgHint;
     List<String>? orderedNames;
+    final all = <String>[];
     for (final ent in dir.listSync(recursive: true)) {
       if (ent is! File) continue;
-      if (p.basename(ent.path).toLowerCase() == 'manifest.json') {
-        try {
-          final map = json.decode(await ent.readAsString()) as Map<String, dynamic>;
-          pkgHint = map['package_name'] as String? ?? map['package'] as String?;
-          final split = map['split_apks'];
-          if (split is List) {
-            orderedNames = split.map((e) {
-              if (e is String) return e;
-              if (e is Map && e['file'] is String) return e['file'] as String;
-              return null;
-            }).whereType<String>().toList();
-          }
-        } catch (_) {}
+      final lower = ent.path.toLowerCase();
+      if (lower.endsWith('.apk')) all.add(ent.path);
+      if (p.basename(lower) == 'manifest.json') {
+        final m = _Manifest.parse(await ent.readAsBytes());
+        if (m != null) {
+          pkgHint = m.packageName;
+          orderedNames = m.splitOrder;
+        }
       }
     }
-    final all = Directory(dir.path)
-        .listSync(recursive: true)
-        .whereType<File>()
-        .where((f) => f.path.toLowerCase().endsWith('.apk'))
-        .map((f) => f.path)
-        .toList();
-
     return _ExtractScan(pkgHint: pkgHint, orderedNames: orderedNames, apkPaths: all);
   }
 
-  static XapkExtractResult _buildExtractResult(_ExtractScan scan) {
-    final all = scan.apkPaths;
-    final orderedNames = scan.orderedNames;
-    final pkgHint = scan.pkgHint;
+  static List<T> _orderParts<T>(List<T> all, String Function(T) baseNameOf, List<String>? orderedNames) {
     if (orderedNames != null && orderedNames.isNotEmpty) {
-      final byBase = {for (final fp in all) p.basename(fp): fp};
-      final ordered = <String>[];
+      final byBase = {for (final x in all) baseNameOf(x): x};
+      final ordered = <T>[];
       for (final n in orderedNames) {
-        final key = p.basename(n);
-        final hit = byBase[key];
-        if (hit != null) ordered.add(hit);
+        final hit = byBase[p.basename(n)];
+        if (hit != null && !ordered.contains(hit)) ordered.add(hit);
       }
-      for (final fp in all) {
-        if (!ordered.contains(fp)) ordered.add(fp);
+      for (final x in all) {
+        if (!ordered.contains(x)) ordered.add(x);
       }
-      return XapkExtractResult(apkPaths: ordered, packageNameHint: pkgHint);
+      return ordered;
     }
-    final sorted = List<String>.from(all)..sort(_apkSortCompareStatic);
-    return XapkExtractResult(apkPaths: sorted, packageNameHint: pkgHint);
+    return List<T>.from(all)..sort((a, b) => _apkSortCompareStatic(baseNameOf(a), baseNameOf(b)));
+  }
+
+  static XapkExtractResult _buildExtractResult(_ExtractScan scan) {
+    return XapkExtractResult(
+      apkPaths: _orderParts<String>(scan.apkPaths, p.basename, scan.orderedNames),
+      packageNameHint: scan.pkgHint,
+    );
   }
 
   static int _apkSortCompareStatic(String a, String b) {
@@ -229,6 +377,9 @@ class XapkService {
     if (startsZipLocal && await _pkStartAndZeroCommentEocdAtEof(f, len)) {
       return true;
     }
+    if (startsZipLocal && await ZipIndex.tryOpen(f.path) != null) {
+      return true;
+    }
 
     try {
       final bytes = await f.readAsBytes();
@@ -243,52 +394,47 @@ class XapkService {
     return startsZipLocal && await _pkStartAndZeroCommentEocdAtEof(f, len);
   }
 
-  /// Reads [manifest.json] from an XAPK without extracting everything to disk.
-  Future<XapkPeek> peek(String xapkPath) async {
-    Archive? archive;
+  static bool _isSafeEntry(ZipEntry e) => !e.isDirectory && !e.name.split('/').contains('..');
+
+  static ZipEntry? _manifestEntry(ZipIndex z) =>
+      z.find((e) => !e.isDirectory && e.baseName.toLowerCase() == 'manifest.json');
+
+  static Future<_Manifest?> _readManifest(ZipIndex z) async {
+    final m = _manifestEntry(z);
+    if (m == null || m.uncompressedSize > 4 * 1024 * 1024) return null;
     try {
-      final bytes = await File(xapkPath).readAsBytes();
-      archive = ZipDecoder().decodeBytes(bytes);
-      if (archive.isEmpty) archive = null;
-    } on RangeError {
-      archive = null;
+      return _Manifest.parse(await z.readBytes(m));
     } catch (_) {
-      archive = null;
+      return null;
     }
-    if (archive != null) {
-      String? pkg;
-      String? vname;
-      String? vcode;
-      ArchiveFile? firstBaseApk;
+  }
 
-      for (final f in archive) {
-        if (!f.isFile) continue;
-        if (p.basename(f.name).toLowerCase() == 'manifest.json') {
-          try {
-            final map = json.decode(utf8.decode(f.content as List<int>)) as Map<String, dynamic>;
-            pkg ??= map['package_name'] as String? ?? map['package'] as String?;
-            vname ??= map['version_name'] as String? ?? map['name'] as String?;
-            vcode ??= map['version_code'] as String?;
-          } catch (_) {}
-        }
-        if (f.name.toLowerCase().endsWith('.apk')) {
-          final base = p.basename(f.name).toLowerCase();
-          final isLikelyBase = base.startsWith('com.') && base.contains('.') && !base.startsWith('config.');
-          if (firstBaseApk == null || isLikelyBase) {
-            firstBaseApk = f;
-            if (isLikelyBase) break;
-          }
-        }
-      }
+  static ZipEntry? _pickBaseApk(Iterable<ZipEntry> apks, String? pkg) {
+    ZipEntry? first;
+    for (final e in apks) {
+      final base = e.baseName.toLowerCase();
+      if (pkg != null && base == '${pkg.toLowerCase()}.apk') return e;
+      if (base == 'base.apk') return e;
+      if (base.startsWith('com.') && !base.startsWith('config.') && !base.startsWith('split_')) return e;
+      if (!base.startsWith('config.') && !base.startsWith('split_')) first ??= e;
+    }
+    return first ?? (apks.isEmpty ? null : apks.first);
+  }
 
+  /// Reads [manifest.json] (and locates the base APK) by listing the ZIP central directory only.
+  Future<XapkPeek> peek(String xapkPath) async {
+    final z = await ZipIndex.tryOpen(xapkPath);
+    if (z != null) {
+      final m = await _readManifest(z);
+      final apks = z.entries.where((e) => _isSafeEntry(e) && e.lowerName.endsWith('.apk'));
       return XapkPeek(
-        packageName: pkg,
-        versionName: vname,
-        versionCode: vcode,
-        sampleApkArchiveFile: firstBaseApk,
+        packageName: m?.packageName,
+        versionName: m?.versionName,
+        versionCode: m?.versionCode,
+        sampleApkEntry: _pickBaseApk(apks, m?.packageName),
+        zip: z,
       );
     }
-
     return _peekViaSystemTar(xapkPath);
   }
 
@@ -308,19 +454,12 @@ class XapkService {
       for (final ent in peekDir.listSync(recursive: true)) {
         if (ent is! File) continue;
         if (p.basename(ent.path).toLowerCase() != 'manifest.json') continue;
-        try {
-          final map = json.decode(await ent.readAsString()) as Map<String, dynamic>;
-          pkg ??= map['package_name'] as String? ?? map['package'] as String?;
-          vname ??= map['version_name'] as String? ?? map['name'] as String?;
-          vcode ??= map['version_code'] as String?;
-        } catch (_) {}
+        final m = _Manifest.parse(await ent.readAsBytes());
+        pkg ??= m?.packageName;
+        vname ??= m?.versionName;
+        vcode ??= m?.versionCode;
       }
-      return XapkPeek(
-        packageName: pkg,
-        versionName: vname,
-        versionCode: vcode,
-        sampleApkArchiveFile: null,
-      );
+      return XapkPeek(packageName: pkg, versionName: vname, versionCode: vcode);
     } finally {
       try {
         if (peekDir.existsSync()) await peekDir.delete(recursive: true);
@@ -331,90 +470,84 @@ class XapkService {
   /// True if this file is a ZIP that contains XAPK-style [manifest.json] (sometimes saved as `.apk`).
   static Future<bool> zipLooksLikeXapkBundle(String path) async {
     if (!path.toLowerCase().endsWith('.apk')) return false;
+    final z = await ZipIndex.tryOpen(path);
+    return z != null && _manifestEntry(z) != null;
+  }
+
+  /// Works out what to send to the device for [path] (APK, XAPK, or a split ZIP saved as `.apk`).
+  ///
+  /// [includeObb] also lists OBB expansion files so the caller can copy them to the device.
+  Future<InstallPlan> planInstall(String path, {bool includeObb = false}) async {
+    final z = await ZipIndex.tryOpen(path);
+    if (z == null) {
+      if (looksLikeXapk(path)) return _planByUnpacking(path);
+      return InstallPlan(sourcePath: path, parts: [InstallPart.localFile(path, await File(path).length())]);
+    }
+
+    // A real APK has AndroidManifest.xml at its root — install it as-is, even if it embeds other APKs.
+    final isPlainApk = z.entries.any((e) => e.name == 'AndroidManifest.xml');
+    if (isPlainApk) {
+      return InstallPlan(sourcePath: path, parts: [InstallPart.localFile(path, z.length)]);
+    }
+
+    final apkEntries =
+        z.entries.where((e) => _isSafeEntry(e) && e.lowerName.endsWith('.apk')).toList();
+    final hasNestedApks = z.entries.any((e) => _isSafeEntry(e) && e.lowerName.endsWith('.apks'));
+    final streamable = apkEntries.every((e) => !e.isEncrypted && (e.method == 0 || e.method == 8));
+    if (apkEntries.isEmpty || !streamable) {
+      if (hasNestedApks || looksLikeXapk(path) || apkEntries.isNotEmpty) return _planByUnpacking(path);
+      return InstallPlan(sourcePath: path, parts: [InstallPart.localFile(path, z.length)]);
+    }
+
+    final m = await _readManifest(z);
+    final ordered = _orderParts<ZipEntry>(apkEntries, (e) => e.baseName, m?.splitOrder);
+    final obbs = <ObbPart>[];
+    if (includeObb) {
+      for (final e in z.entries) {
+        if (!_isSafeEntry(e)) continue;
+        final mapped = m?.expansions?[e.name];
+        final isObbPath = e.lowerName.startsWith('android/obb/') && e.lowerName.endsWith('.obb');
+        if (mapped == null && !isObbPath) continue;
+        final rel = (mapped ?? e.name).replaceFirst(RegExp(r'^/+'), '');
+        if (rel.split('/').contains('..')) continue;
+        obbs.add(ObbPart(z, e, '/sdcard/$rel'));
+      }
+    }
+    return InstallPlan(
+      sourcePath: path,
+      parts: [for (final e in ordered) InstallPart.zipEntry(z, e)],
+      obbs: obbs,
+      packageName: m?.packageName,
+    );
+  }
+
+  Future<InstallPlan> _planByUnpacking(String path) async {
+    final dir = await AppPaths.newJobExtractDirectory();
     try {
-      final bytes = await File(path).readAsBytes();
-      if (bytes.length < 4 || bytes[0] != 0x50 || bytes[1] != 0x4b) return false;
-      final z = ZipDecoder().decodeBytes(bytes);
-      for (final f in z) {
-        if (!f.isFile) continue;
-        final bn = p.basename(f.name.replaceAll('\\', '/')).toLowerCase();
-        if (bn == 'manifest.json') return true;
-      }
-      return false;
+      final r = await _extractInto(path, dir);
+      final parts = <InstallPart>[
+        for (final f in r.apkPaths) InstallPart.localFile(f, await File(f).length()),
+      ];
+      return InstallPlan(sourcePath: path, parts: parts, packageName: r.packageNameHint, workDir: dir);
     } catch (_) {
-      return false;
-    }
-  }
-
-  /// Some stores ship a **multi-split ZIP** or **single wrapped APK** saved as `.apk`.
-  /// Detect inner `*.apk` entries and extract to temp paths for `adb install-multiple`.
-  Future<List<String>> apkPartsFromApkArchiveIfBundle(String apkPath) async {
-    try {
-      final bytes = await File(apkPath).readAsBytes();
-      if (bytes.length < 4 || bytes[0] != 0x50 || bytes[1] != 0x4b) return [apkPath];
-      final Archive archive;
       try {
-        archive = ZipDecoder().decodeBytes(bytes);
-      } catch (_) {
-        return [apkPath];
-      }
-      final apkEntries = <ArchiveFile>[];
-      for (final f in archive) {
-        if (!f.isFile) continue;
-        final norm = f.name.replaceAll('\\', '/');
-        if (norm.contains('..')) continue;
-        if (!p.basename(norm).toLowerCase().endsWith('.apk')) continue;
-        apkEntries.add(f);
-      }
-      if (apkEntries.isEmpty) return [apkPath];
-
-      final dir = await AppPaths.tempExtractDirectory();
-      if (apkEntries.length == 1) {
-        final inner = apkEntries.first;
-        final innerBase = p.basename(inner.name.replaceAll('\\', '/'));
-        final outerBase = p.basename(apkPath);
-        if (innerBase.toLowerCase() == outerBase.toLowerCase()) return [apkPath];
-        final safe = innerBase.replaceAll(RegExp(r'[<>:"|?*\\/]'), '_');
-        final t = p.join(dir.path, safe.isEmpty ? 'base.apk' : safe);
-        await File(t).writeAsBytes(inner.content as List<int>);
-        return [t];
-      }
-
-      final paths = <String>[];
-      for (final f in apkEntries) {
-        final norm = f.name.replaceAll('\\', '/');
-        final safe = p.basename(norm).replaceAll(RegExp(r'[<>:"|?*\\/]'), '_');
-        final t = p.join(dir.path, safe.isEmpty ? 'part_${paths.length}.apk' : safe);
-        await File(t).parent.create(recursive: true);
-        await File(t).writeAsBytes(f.content as List<int>);
-        paths.add(t);
-      }
-      paths.sort(_apkSortCompareStatic);
-      return paths;
-    } catch (_) {
-      return [apkPath];
+        await dir.delete(recursive: true);
+      } catch (_) {}
+      rethrow;
     }
   }
 
-  /// Resolves adb install paths: XAPK / nested bundles / multi-apk ZIP saved as `.apk`.
-  Future<List<String>> resolveAdbInstallParts(String path, {required bool useXapkPipeline}) async {
-    final lower = path.toLowerCase();
-    if (useXapkPipeline || lower.endsWith('.xapk')) {
-      try {
-        final r = await extractApks(path);
-        if (r.apkPaths.isNotEmpty) return r.apkPaths;
-      } catch (_) {
-        /* try plain zip below */
-      }
-    }
-    if (lower.endsWith('.apk')) {
-      return apkPartsFromApkArchiveIfBundle(path);
-    }
-    return [path];
-  }
-
+  /// Unpacks every APK from an XAPK into a new private temp folder (legacy / fallback path).
   Future<XapkExtractResult> extractApks(String xapkPath) async {
-    var dir = await AppPaths.tempExtractDirectory();
+    return _extractInto(xapkPath, await AppPaths.newJobExtractDirectory());
+  }
+
+  Future<XapkExtractResult> _extractInto(String xapkPath, Directory dir) async {
+    Future<void> reset() async {
+      if (await dir.exists()) await dir.delete(recursive: true);
+      await dir.create(recursive: true);
+    }
+
     final tarFirst = await _runTarExtract(xapkPath, dir.path);
     if (tarFirst.exitCode == 0) {
       final scan = await _scanExtractedFolderWithNested(dir);
@@ -423,7 +556,7 @@ class XapkService {
       }
     }
 
-    dir = await AppPaths.tempExtractDirectory();
+    await reset();
     try {
       final bytes = await File(xapkPath).readAsBytes();
       final archive = ZipDecoder().decodeBytes(bytes);
@@ -441,7 +574,7 @@ class XapkService {
       }
       return _buildExtractResult(scan);
     } catch (_) {
-      dir = await AppPaths.tempExtractDirectory();
+      await reset();
       final retry = await _runTarExtract(xapkPath, dir.path);
       if (retry.exitCode != 0) {
         final err = '${retry.stderr}${retry.stdout}'.trim();

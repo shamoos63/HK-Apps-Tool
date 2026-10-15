@@ -27,7 +27,7 @@ class AboutPage extends StatelessWidget {
               Text(
                 'أداة صممت بحب ❤️ لتسهيل العمل على جميع الفنيين، لإدارة ملفات التثبيت الخاصة بتطبيقات الأندرويد وتحديثها \n'
                 'مهداة إلى جميع أعضاء موقع حلب تك بشكل مجاني',
-                style: t.bodyLarge?.copyWith(height: 1.45, color: Colors.black87),
+                style: t.bodyLarge?.copyWith(height: 1.45, color: Theme.of(context).colorScheme.onSurface),
               ),
               const SizedBox(height: 24),
               Text('Developer', style: t.titleMedium?.copyWith(fontWeight: FontWeight.w600)),

@@ -5,6 +5,7 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 import 'adb_paths.dart';
+import 'zip_index.dart';
 
 class ApkBadging {
   ApkBadging({
@@ -115,9 +116,21 @@ class AaptService {
     return bestPath;
   }
 
-  Future<Uint8List?> readLauncherIconBytes(String apkPath) async {
-    final badging = await readBadging(apkPath);
+  /// Launcher icon bytes. Pass [badging] when already known to skip a second `aapt` run.
+  ///
+  /// Reads only the ZIP directory plus the icon entry instead of loading the whole APK.
+  Future<Uint8List?> readLauncherIconBytes(String apkPath, {ApkBadging? badging}) async {
+    badging ??= await readBadging(apkPath);
     final rel = badging?.iconZipPath;
+    final idx = await ZipIndex.tryOpen(apkPath);
+    if (idx != null) {
+      try {
+        return await _iconFromIndex(idx, rel);
+      } catch (_) {
+        // fall back to the full decoder below
+      }
+    }
+
     final bytes = await File(apkPath).readAsBytes();
     final archive = ZipDecoder().decodeBytes(bytes);
 
@@ -134,6 +147,63 @@ class AaptService {
     final fb = _fallbackIconFile(archive);
     if (fb != null) return Uint8List.fromList(fb.content as List<int>);
     return null;
+  }
+
+  /// Same lookup order as the [Archive] path, but over a [ZipIndex] (entries read on demand).
+  Future<Uint8List?> _iconFromIndex(ZipIndex idx, String? rel) async {
+    ZipEntry? loose(String path) {
+      final want = path.replaceAll('\\', '/').toLowerCase();
+      return idx.find((e) => !e.isDirectory && (e.lowerName == want || e.lowerName.endsWith(want)));
+    }
+
+    if (rel != null && rel.isNotEmpty && !rel.endsWith('.xml')) {
+      final norm = rel.replaceAll('\\', '/');
+      final base = p.basename(norm);
+      final hit = loose(norm) ?? idx.find((e) => !e.isDirectory && e.baseName == base);
+      if (hit != null) return idx.readBytes(hit);
+    }
+
+    for (final f in idx.entries) {
+      final n = f.lowerName;
+      if (f.isDirectory || !n.endsWith('ic_launcher.xml') || !n.contains('mipmap-anydpi')) continue;
+      final xml = String.fromCharCodes(await idx.readBytes(f));
+      final fg = RegExp(r'android:foreground="@drawable/([^"]+)"').firstMatch(xml)?.group(1) ??
+          RegExp(r'android:drawable="@drawable/([^"]+)"').firstMatch(xml)?.group(1);
+      if (fg == null) continue;
+      ZipEntry? hit;
+      for (final ext in ['.png', '.webp']) {
+        for (final dens in ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi']) {
+          hit ??= loose('res/drawable-$dens-v4/$fg$ext');
+          hit ??= loose('res/drawable-$dens/$fg$ext');
+        }
+      }
+      hit ??= idx.find((e) {
+        final low = e.baseName.toLowerCase();
+        return !e.isDirectory && (low == '$fg.png' || low == '$fg.webp') && e.lowerName.contains('drawable');
+      });
+      if (hit != null) return idx.readBytes(hit);
+    }
+
+    const densityRank = ['xxxhdpi', 'xxhdpi', 'xhdpi', 'hdpi', 'mdpi', 'ldpi', 'nodpi'];
+    ZipEntry? best;
+    var bestRank = -1;
+    for (final f in idx.entries) {
+      final n = f.lowerName;
+      if (f.isDirectory || !(n.endsWith('.png') || n.endsWith('.webp'))) continue;
+      if (!(n.contains('ic_launcher') && n.contains('mipmap')) || n.contains('mipmap-anydpi')) continue;
+      var rank = 0;
+      for (var i = 0; i < densityRank.length; i++) {
+        if (n.contains('mipmap-${densityRank[i]}')) {
+          rank = i + 1;
+          break;
+        }
+      }
+      if (rank > bestRank || (rank == bestRank && best != null && f.name.length > best.name.length)) {
+        bestRank = rank;
+        best = f;
+      }
+    }
+    return best == null ? null : idx.readBytes(best);
   }
 
   /// Follows `mipmap-anydpi-v26/ic_launcher.xml` foreground drawable when it points to a bitmap.

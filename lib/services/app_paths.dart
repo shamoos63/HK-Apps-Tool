@@ -86,13 +86,38 @@ class AppPaths {
     return dir;
   }
 
-  static Future<Directory> tempExtractDirectory() async {
+  /// Test / benchmark hook: when set, temp extraction folders are created here instead of app support.
+  static Directory? debugTempRootOverride;
+
+  static var _jobCounter = 0;
+
+  static Future<Directory> _tempRoot() async {
+    final override = debugTempRootOverride;
+    if (override != null) return Directory(p.join(override.path, 'temp_xapk_jobs'));
     final base = await getApplicationSupportDirectory();
-    final dir = Directory(p.join(base.path, 'temp_xapk'));
-    if (dir.existsSync()) {
-      await dir.delete(recursive: true);
-    }
+    return Directory(p.join(base.path, 'temp_xapk_jobs'));
+  }
+
+  /// A fresh, private folder for one install job. Each job gets its own folder so several
+  /// XAPKs can be unpacked at the same time; the caller deletes it when the install finishes.
+  static Future<Directory> newJobExtractDirectory() async {
+    final root = await _tempRoot();
+    final dir = Directory(
+      p.join(root.path, 'job_${DateTime.now().microsecondsSinceEpoch}_${_jobCounter++}'),
+    );
     await dir.create(recursive: true);
     return dir;
+  }
+
+  /// Removes leftovers from a previous run (crash, force-quit) plus the old shared `temp_xapk` folder.
+  static Future<void> purgeStaleExtractDirectories() async {
+    try {
+      final root = await _tempRoot();
+      if (await root.exists()) await root.delete(recursive: true);
+      if (debugTempRootOverride == null) {
+        final legacy = Directory(p.join((await getApplicationSupportDirectory()).path, 'temp_xapk'));
+        if (await legacy.exists()) await legacy.delete(recursive: true);
+      }
+    } catch (_) {}
   }
 }
