@@ -156,6 +156,8 @@ class _DownloadTaskCard extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Text(task.label, style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600)),
+            if (task.sourceLabel != null)
+              Text(task.sourceLabel!, style: theme.textTheme.labelMedium?.copyWith(color: theme.colorScheme.primary)),
             const SizedBox(height: 4),
             SelectableText(
               task.destinationPath,

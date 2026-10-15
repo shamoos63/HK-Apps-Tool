@@ -90,6 +90,17 @@ class UptodownSearchService {
     return sub.replaceAll('-', '.');
   }
 
+  final _packageNames = <String, String?>{};
+
+  /// Real Android package name from an app page's "Package Name" row (URLs only carry a slug).
+  Future<String?> packageNameOf(String pageUrl) async {
+    final key = pageUrl.split('#').first.split('?').first;
+    if (_packageNames.containsKey(key)) return _packageNames[key];
+    final body = await _get(Uri.parse(key), referer: 'https://en.uptodown.com/');
+    final m = RegExp(r'Package Name</th>\s*<td>\s*([A-Za-z0-9_.]+)\s*</td>', caseSensitive: false).firstMatch(body);
+    return _packageNames[key] = m?.group(1);
+  }
+
   bool _warmed = false;
 
   Future<void> _warm({CancellationToken? cancel}) async {
@@ -138,7 +149,7 @@ class UptodownSearchService {
       if (!abs.contains('.en.uptodown.com/android')) continue;
       if (abs.contains('/download')) continue;
       final pkg = _packageIdFromAppUrl(abs);
-      if (pkg == null || !pkg.contains('.')) continue;
+      if (pkg == null) continue;
       if (!seen.add(pkg)) continue;
       final title = a.text.replaceAll(RegExp(r'\s+'), ' ').trim();
       hits.add(

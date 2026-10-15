@@ -2,7 +2,6 @@ import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import 'package:collection/collection.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
@@ -34,14 +33,6 @@ class DeviceAppVm {
   String? storeVersion;
   bool? updateAvailable;
   ApkpureReleaseInfo? pendingRelease;
-}
-
-ApkpureSearchHit? _pickStoreHit(List<ApkpureSearchHit> hits, String packageName) {
-  final exact = hits.firstWhereOrNull((h) => h.packageId == packageName);
-  if (exact != null) return exact;
-  final nonUtd = hits.where((h) => !h.isUptodown).toList();
-  if (nonUtd.length == 1) return nonUtd.first;
-  return hits.firstOrNull;
 }
 
 class DeviceAppsPage extends StatefulWidget {
@@ -221,20 +212,18 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
     if (serial == null) return;
     setState(() => app.checkUpdateBusy = true);
     try {
-      final hits = await _store.search(app.packageName);
-      final hit = _pickStoreHit(hits, app.packageName);
-      if (hit == null) {
+      final rel = await _store.latestFor(app.packageName, title: app.displayName);
+      if (rel == null) {
         app.storeVersion = null;
         app.updateAvailable = null;
         app.pendingRelease = null;
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('No store listing found for ${app.packageName}.')),
+            SnackBar(content: Text('No download source has ${app.packageName}.')),
           );
         }
         return;
       }
-      final rel = await _store.fetchRelease(hit);
       app.storeVersion = rel.version;
       final installed = await _adb.installedVersionName(serial, app.packageName);
       app.updateAvailable = _store.looksNewer(rel.version, installed);
@@ -256,12 +245,10 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
     setState(() => app.downloadInstallBusy = true);
     try {
       final dir = await AppPaths.apkDownloadDirectory();
-      final isXapkUrl = rel.downloadUrl.toUpperCase().contains('XAPK') ||
-          rel.downloadUrl.toLowerCase().contains('.xapk');
-      final ext = isXapkUrl ? 'xapk' : 'apk';
+      final ext = rel.option?.extension ?? (rel.downloadUrl.toUpperCase().contains('XAPK') ? 'xapk' : 'apk');
       final dest = File(p.join(dir.path, '${app.packageName}.$ext'));
 
-      await DownloadQueue.instance.beginStoreDownload(
+      final saved = await DownloadQueue.instance.beginStoreDownload(
         store: _store,
         info: rel,
         label: app.displayName,
@@ -274,7 +261,7 @@ class _DeviceAppsPageState extends State<DeviceAppsPage> {
         context,
         message: 'Installing ${app.displayName}…',
         work: () => ApkInstaller(adb: _adb, xapk: _xapk)
-            .installFile(dest.path, serial, includeObb: InstallQueue.instance.copyObb),
+            .installFile(saved.path, serial, includeObb: InstallQueue.instance.copyObb),
       );
       if (!mounted) return;
       showAdbSnack(

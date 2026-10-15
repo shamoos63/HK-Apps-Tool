@@ -14,6 +14,7 @@ import 'services/adb_paths.dart';
 import 'services/adb_service.dart';
 import 'services/apk_library_folder_helper.dart';
 import 'services/app_paths.dart';
+import 'services/cancellation.dart';
 import 'services/combined_apk_store_service.dart';
 import 'services/download_queue.dart';
 import 'services/install_queue.dart';
@@ -443,19 +444,20 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
         if (mounted) _toast('Nothing to search — Application label missing and no package id.');
         return;
       }
-      final hits = await _store.search(query);
-      final pkg = row.packageId;
-      final hit = pkg != null
-          ? (hits.firstWhereOrNull((h) => h.packageId == pkg) ?? hits.firstOrNull)
-          : hits.firstOrNull;
-      if (hit == null) {
+      // Known package: ask every source for that exact app; otherwise resolve the name first.
+      var pkg = row.packageId;
+      if (pkg == null || !pkg.contains('.')) {
+        final hits = await _store.search(query);
+        pkg = hits.firstOrNull?.packageId;
+      }
+      final rel = pkg == null ? null : await _store.latestFor(pkg, title: row.label);
+      if (rel == null) {
         row.remoteVersion = null;
         row.updateAvailable = null;
         row.updateRelease = null;
-        if (mounted) _toast('No store listing found for "$query".');
+        if (mounted) _toast('No download source has "$query".');
         return;
       }
-      final rel = await _store.fetchRelease(hit);
       row.remoteVersion = rel.version;
       row.updateRelease = rel;
       final dv = row.deviceVersion ?? row.localVersion;
@@ -476,9 +478,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     setState(() => row.downloadUpdateBusy = true);
     try {
       final dir = await AppPaths.apkDownloadDirectory();
-      final isXapk = rel.downloadUrl.toUpperCase().contains('XAPK') ||
-          rel.downloadUrl.toLowerCase().contains('.xapk');
-      final ext = isXapk ? '.xapk' : '.apk';
+      final ext = '.${rel.option?.extension ?? (rel.downloadUrl.toUpperCase().contains('XAPK') ? 'xapk' : 'apk')}';
       final stem = AaptService.sanitizeFileStem(row.badging?.label?.trim() ?? '');
       final baseName = stem.isNotEmpty
           ? stem
@@ -486,15 +486,17 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
               ? row.packageId!
               : p.basenameWithoutExtension(row.path);
       final dest = File(p.join(dir.path, '$baseName$ext'));
-      await DownloadQueue.instance.beginStoreDownload(
+      final saved = await DownloadQueue.instance.beginStoreDownload(
         store: _store,
         info: rel,
         label: row.title ?? row.displayName,
         destination: dest,
       );
       if (!mounted) return;
-      _toast('Saved newer build to ${dest.path}');
+      _toast('Saved newer build to ${saved.path}');
       await _refreshPackages();
+    } on OperationCanceled {
+      // Canceled from the Downloads tab.
     } catch (e) {
       if (mounted) _toast('Download failed: $e');
     } finally {

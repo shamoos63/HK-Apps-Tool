@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:html/parser.dart' as html_parser;
 
+import 'app_catalog.dart' show DownloadOption;
 import 'cancellation.dart';
 import 'xapk_service.dart';
 
@@ -35,7 +36,11 @@ class ApkpureReleaseInfo {
     required this.downloadUrl,
     required this.pageUrl,
     this.downloadReferer,
+    this.option,
   });
+
+  /// The concrete build behind this release (new catalogue); null for legacy scraped links.
+  final DownloadOption? option;
 
   final String title;
   final String version;

@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -18,7 +19,10 @@ class DownloadTask {
 
   final String id;
   final String label;
-  final String destinationPath;
+  /// Updated to the real file name when the download finishes (`.apk` vs `.xapk`).
+  String destinationPath;
+  /// e.g. "APKPure · 1.2.3 · XAPK + OBB".
+  String? sourceLabel;
   final CancellationToken cancelToken;
 
   DownloadTaskStatus status = DownloadTaskStatus.queued;
@@ -67,6 +71,30 @@ class DownloadQueue extends ChangeNotifier {
 
   static const _maxHistory = 40;
 
+  /// Each download already uses several connections; a few at once keeps the line saturated
+  /// without starving the others.
+  static const maxParallel = 3;
+  int _running = 0;
+  final _waiting = <Completer<void>>[];
+
+  Future<void> _acquire() async {
+    if (_running < maxParallel) {
+      _running++;
+      return;
+    }
+    final c = Completer<void>();
+    _waiting.add(c);
+    await c.future;
+  }
+
+  void _release() {
+    if (_waiting.isNotEmpty) {
+      _waiting.removeAt(0).complete();
+    } else if (_running > 0) {
+      _running--;
+    }
+  }
+
   final List<DownloadTask> tasks = [];
 
   int get activeRunningCount =>
@@ -76,14 +104,18 @@ class DownloadQueue extends ChangeNotifier {
   void cancelTask(String id) {
     for (final t in tasks) {
       if (t.id != id) continue;
-      if (t.status != DownloadTaskStatus.running) return;
+      if (t.status != DownloadTaskStatus.running && t.status != DownloadTaskStatus.queued) return;
       t.cancelToken.cancel();
+      if (t.status == DownloadTaskStatus.queued) {
+        t.status = DownloadTaskStatus.cancelled;
+        notifyListeners();
+      }
       return;
     }
   }
 
-  /// Starts a download (optionally switches to the Downloads tab first).
-  Future<void> beginStoreDownload({
+  /// Starts a download (optionally switches to the Downloads tab first) and returns the saved file.
+  Future<File> beginStoreDownload({
     required CombinedApkStoreService store,
     required ApkpureReleaseInfo info,
     required String label,
@@ -99,12 +131,25 @@ class DownloadQueue extends ChangeNotifier {
       destinationPath: destination.path,
       cancelToken: cancel,
     );
+    final o = info.option;
+    if (o != null) {
+      task.sourceLabel = [
+        o.source.label,
+        'v${o.versionName}',
+        o.hasObb ? 'XAPK + OBB' : o.extension.toUpperCase(),
+      ].join(' · ');
+    }
     tasks.insert(0, task);
     while (tasks.length > _maxHistory) {
       tasks.removeLast();
     }
     notifyListeners();
 
+    await _acquire();
+    if (cancel.isCancelled) {
+      _release();
+      throw OperationCanceled();
+    }
     task.status = DownloadTaskStatus.running;
     task.received = 0;
     task.totalBytes = null;
@@ -112,9 +157,9 @@ class DownloadQueue extends ChangeNotifier {
     task.resetSpeedMeter();
     notifyListeners();
 
+    var lastPaint = DateTime.fromMillisecondsSinceEpoch(0);
     try {
-      if (destination.existsSync()) await destination.delete();
-      await store.downloadRelease(
+      final saved = await store.downloadRelease(
         info,
         destination,
         cancel: cancel,
@@ -122,34 +167,33 @@ class DownloadQueue extends ChangeNotifier {
           task.received = received;
           task.totalBytes = total;
           task.updateSpeedFromProgress(received);
-          notifyListeners();
+          final now = DateTime.now();
+          if (now.difference(lastPaint).inMilliseconds >= 100) {
+            lastPaint = now;
+            notifyListeners();
+          }
         },
       );
-      task.received = await destination.length();
+      task.destinationPath = saved.path;
+      task.received = await saved.length();
       task.totalBytes = task.received;
       task.status = DownloadTaskStatus.succeeded;
       notifyListeners();
+      return saved;
     } on OperationCanceled {
       task.status = DownloadTaskStatus.cancelled;
       task.errorMessage = null;
       task.resetSpeedMeter();
-      if (destination.existsSync()) {
-        try {
-          await destination.delete();
-        } catch (_) {}
-      }
       notifyListeners();
+      rethrow;
     } catch (e) {
       task.status = DownloadTaskStatus.failed;
       task.errorMessage = e.toString();
       task.resetSpeedMeter();
-      if (destination.existsSync()) {
-        try {
-          await destination.delete();
-        } catch (_) {}
-      }
       notifyListeners();
       rethrow;
+    } finally {
+      _release();
     }
   }
 
