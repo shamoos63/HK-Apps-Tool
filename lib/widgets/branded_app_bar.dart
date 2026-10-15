@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 /// Declared as a Flutter asset (see pubspec.yaml).
 const String kAppLogoAssetPath = 'Logo.png';
 
-/// [AppBar] with the HK Apps Tool logo replacing the default back/menu affordance area.
+/// Page [AppBar] used by every tab.
 class BrandedAppBar extends StatelessWidget implements PreferredSizeWidget {
   const BrandedAppBar({
     super.key,
@@ -19,33 +19,10 @@ class BrandedAppBar extends StatelessWidget implements PreferredSizeWidget {
 
   @override
   Widget build(BuildContext context) {
-    const logoSize = 30.0;
+    // The logo already sits in the navigation rail (and the title bar on Windows).
     return AppBar(
       automaticallyImplyLeading: false,
-      titleSpacing: 8,
-      leading: Padding(
-        padding: const EdgeInsets.fromLTRB(10, 8, 4, 8),
-        child: Tooltip(
-          message: 'HK Apps Tool',
-          child: ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: Image.asset(
-              kAppLogoAssetPath,
-              width: logoSize,
-              height: logoSize,
-              fit: BoxFit.cover,
-              filterQuality: FilterQuality.high,
-              gaplessPlayback: true,
-              errorBuilder: (context, error, stackTrace) => Icon(
-                Icons.apps_rounded,
-                size: logoSize,
-                color: Theme.of(context).colorScheme.primary,
-              ),
-            ),
-          ),
-        ),
-      ),
-      leadingWidth: 48,
+      titleSpacing: 20,
       title: title,
       actions: actions,
     );

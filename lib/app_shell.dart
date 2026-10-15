@@ -7,6 +7,8 @@ import 'device_apps_page.dart';
 import 'downloads_page.dart';
 import 'local_install_page.dart';
 import 'widgets/branded_app_bar.dart';
+import 'widgets/window_title_bar.dart';
+import 'app_theme.dart';
 import 'services/combined_apk_store_service.dart';
 import 'services/download_queue.dart';
 import 'services/install_queue.dart';
@@ -78,11 +80,29 @@ class _AppShellState extends State<AppShell> {
       body: ListenableBuilder(
         listenable: Listenable.merge([DownloadQueue.instance, InstallQueue.instance]),
         builder: (context, _) {
-          return Row(
+          final shell = Row(
             children: [
               NavigationRail(
                 selectedIndex: _index,
                 onDestinationSelected: _goTab,
+                // Without the custom title bar (macOS) the theme switch lives at the bottom of the rail.
+                trailing: useCustomTitleBar
+                    ? null
+                    : Expanded(
+                        child: Align(
+                          alignment: Alignment.bottomCenter,
+                          child: Padding(
+                            padding: const EdgeInsets.only(bottom: 16),
+                            child: IconButton(
+                              tooltip: 'Switch light / dark',
+                              onPressed: () => ThemeController.instance.toggle(Theme.of(context).brightness),
+                              icon: Icon(Theme.of(context).brightness == Brightness.dark
+                                  ? Icons.light_mode_rounded
+                                  : Icons.dark_mode_rounded),
+                            ),
+                          ),
+                        ),
+                      ),
                 leading: Padding(
                   padding: const EdgeInsets.fromLTRB(8, 16, 8, 24),
                   child: Column(
@@ -142,6 +162,13 @@ class _AppShellState extends State<AppShell> {
                   children: pages,
                 ),
               ),
+            ],
+          );
+          if (!useCustomTitleBar) return shell;
+          return Column(
+            children: [
+              const WindowTitleBar(),
+              Expanded(child: shell),
             ],
           );
         },
