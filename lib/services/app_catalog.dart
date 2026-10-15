@@ -233,12 +233,17 @@ class AppCatalog {
       final label = RegExp(r'aria-label="([^"]+)"').firstMatch(m.group(2)!)?.group(1);
       final tail = html.substring(m.end, (m.end + 2500).clamp(0, html.length));
       final icon = RegExp(r'src="(https://play-lh\.googleusercontent\.com/[^"=]+)=s\d+[^"]*"').firstMatch(tail)?.group(1);
-      String? title = label;
-      title ??= RegExp(r'<div class="[^"]*">([^<]{2,80})</div>').firstMatch(tail)?.group(1);
+      // List cards: <span>Title</span> then <span>Developer</span> inside the link.
+      final card = tail.substring(0, tail.contains('</a>') ? tail.indexOf('</a>') : tail.length);
+      final spans = RegExp(r'<span class="[^"]*">([^<]{2,100})</span>').allMatches(card).map((x) => x.group(1)!).toList();
+      final divs = RegExp(r'<div class="[^"]*">([^<]{2,100})</div>').allMatches(tail).map((x) => x.group(1)!).toList();
+      final title = label ?? spans.firstOrNull ?? divs.firstOrNull;
+      final developer = label != null ? divs.skip(1).firstOrNull : spans.skip(1).firstOrNull;
       out.add(AppListing(
         packageId: pkg,
         title: _unescape(title ?? pkg),
         iconUrl: icon == null ? null : '$icon=s128',
+        developer: developer == null ? null : _unescape(developer),
       ));
       if (out.length >= 20) break;
     }

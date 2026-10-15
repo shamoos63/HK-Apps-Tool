@@ -482,19 +482,14 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Flexible(
-                        child: Text('v${o.versionName}',
-                            style: t.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-                            overflow: TextOverflow.ellipsis),
-                      ),
-                      const SizedBox(width: 8),
-                      if (recommended && o.warning == null)
-                        Text('Recommended',
-                            style: t.labelSmall?.copyWith(color: scheme.primary, fontWeight: FontWeight.w700)),
-                    ],
-                  ),
+                  if (recommended && o.warning == null)
+                    Text('RECOMMENDED',
+                        style: t.labelSmall?.copyWith(
+                            color: scheme.primary, fontWeight: FontWeight.w800, letterSpacing: 0.6)),
+                  Text('v${o.versionName}',
+                      style: t.titleSmall?.copyWith(fontWeight: FontWeight.w700),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis),
                   const SizedBox(height: 2),
                   Text(
                     [
