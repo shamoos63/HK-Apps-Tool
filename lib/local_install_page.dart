@@ -54,7 +54,7 @@ class _LocalRow {
   bool downloadUpdateBusy = false;
   String? deviceVersion;
   bool? installed;
-  /// When the file landed in the library (file modified time) — drives the "Newest" tag.
+  /// When the file landed in the library (file modified time) — used by the "Recently added" sort.
   DateTime? addedAt;
 
   String get path => file.path;
@@ -84,7 +84,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
   String? _adbError;
   Map<String, String>? _deviceProps;
 
-  /// Library order: false = A–Z (default), true = newest files first. Persisted.
+  /// Library order: false = A–Z (default), true = most recently added files first. Persisted.
   bool _newestFirst = false;
   static const _prefsNewestFirst = 'library_sort_newest_first';
 
@@ -119,15 +119,39 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
     return rows.where(hit).toList();
   }
 
-  /// The most recently added library file (only tagged when there is more than one file).
-  String? get _newestPath {
-    if (_rows.length < 2) return null;
-    _LocalRow? best;
+  /// When the library holds several files of the same app, the highest version is tagged
+  /// "Newest" (true) and the others "Older" (false). Apps with a single file get no tag.
+  Map<String, bool> get _versionTags {
+    final byPkg = <String, List<_LocalRow>>{};
     for (final r in _rows) {
-      if (r.addedAt == null) continue;
-      if (best == null || r.addedAt!.isAfter(best.addedAt!)) best = r;
+      final pkg = r.packageId;
+      if (pkg == null || r.metaBusy) continue;
+      byPkg.putIfAbsent(pkg, () => []).add(r);
     }
-    return best?.path;
+    final tags = <String, bool>{};
+    for (final group in byPkg.values) {
+      if (group.length < 2) continue;
+      final sorted = [...group]..sort(_compareRowVersions);
+      final best = sorted.first;
+      for (final r in group) {
+        // Same version as the best (e.g. a duplicate copy) also counts as newest.
+        tags[r.path] = identical(r, best) || _compareRowVersions(r, best) == 0;
+      }
+    }
+    return tags;
+  }
+
+  /// Highest version first: versionCode when both files have one, else the version name.
+  static int _compareRowVersions(_LocalRow a, _LocalRow b) {
+    final ca = int.tryParse(a.badging?.versionCode ?? '');
+    final cb = int.tryParse(b.badging?.versionCode ?? '');
+    if (ca != null && cb != null && ca != cb) return cb.compareTo(ca);
+    final na = RegExp(r'\d+').allMatches(a.localVersion ?? '').map((m) => int.parse(m.group(0)!)).toList();
+    final nb = RegExp(r'\d+').allMatches(b.localVersion ?? '').map((m) => int.parse(m.group(0)!)).toList();
+    for (var i = 0; i < na.length && i < nb.length; i++) {
+      if (na[i] != nb[i]) return nb[i].compareTo(na[i]);
+    }
+    return nb.length.compareTo(na.length);
   }
 
   List<AdbDevice> get _targets {
@@ -734,7 +758,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                             onSelected: _setNewestFirst,
                             itemBuilder: (_) => const [
                               PopupMenuItem(value: false, child: Text('Name (A–Z)')),
-                              PopupMenuItem(value: true, child: Text('Newest first')),
+                              PopupMenuItem(value: true, child: Text('Recently added first')),
                             ],
                             child: Padding(
                               padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
@@ -743,7 +767,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                                 children: [
                                   const Icon(Icons.sort_rounded, size: 20),
                                   const SizedBox(width: 4),
-                                  Text(_newestFirst ? 'Newest' : 'A–Z'),
+                                  Text(_newestFirst ? 'Recent' : 'A–Z'),
                                 ],
                               ),
                             ),
@@ -1111,7 +1135,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
         row.deviceVersion == row.localVersion;
     final compact = DensityController.instance.value;
     final iconSize = compact ? 32.0 : 48.0;
-    final isNewest = row.path == _newestPath;
+    final versionTag = _versionTags[row.path]; // true = newest copy of this app, false = older copy
 
     return Card(
       color: selected ? scheme.primaryContainer.withValues(alpha: 0.35) : null,
@@ -1162,12 +1186,16 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                                 overflow: TextOverflow.ellipsis,
                               ),
                             ),
-                            if (isNewest) ...[
+                            if (versionTag == true) ...[
                               const SizedBox(width: 8),
                               _chip(context, 'Newest',
                                   icon: Icons.fiber_new_rounded,
                                   bg: scheme.secondaryContainer,
                                   fg: scheme.onSecondaryContainer),
+                            ],
+                            if (versionTag == false) ...[
+                              const SizedBox(width: 8),
+                              _chip(context, 'Older version', icon: Icons.history_rounded),
                             ],
                             if (compact) ...[
                               const SizedBox(width: 8),
