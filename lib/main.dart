@@ -14,6 +14,7 @@ Future<void> main() async {
   unawaited(AppPaths.purgeStaleExtractDirectories());
   unawaited(InstallQueue.instance.loadSettings());
   await ThemeController.instance.load();
+  await DensityController.instance.load();
 
   if (useCustomTitleBar) {
     // Hide the system title bar; the app draws its own (see WindowTitleBar).
@@ -39,14 +40,14 @@ class HkAppsToolApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<ThemeMode>(
-      valueListenable: ThemeController.instance,
-      builder: (context, mode, _) => MaterialApp(
+    return ListenableBuilder(
+      listenable: Listenable.merge([ThemeController.instance, DensityController.instance]),
+      builder: (context, _) => MaterialApp(
         title: 'HK Apps Tool',
         debugShowCheckedModeBanner: false,
-        theme: buildAppTheme(),
-        darkTheme: buildAppDarkTheme(),
-        themeMode: mode,
+        theme: buildAppTheme(compact: DensityController.instance.value),
+        darkTheme: buildAppDarkTheme(compact: DensityController.instance.value),
+        themeMode: ThemeController.instance.value,
         home: const AppShell(),
       ),
     );

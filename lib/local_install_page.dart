@@ -7,6 +7,7 @@ import 'package:desktop_drop/desktop_drop.dart';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'app_theme.dart';
 import 'services/aapt_service.dart';
@@ -53,6 +54,8 @@ class _LocalRow {
   bool downloadUpdateBusy = false;
   String? deviceVersion;
   bool? installed;
+  /// When the file landed in the library (file modified time) — drives the "Newest" tag.
+  DateTime? addedAt;
 
   String get path => file.path;
   String get displayName => p.basename(path);
@@ -81,9 +84,28 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
   String? _adbError;
   Map<String, String>? _deviceProps;
 
+  /// Library order: false = A–Z (default), true = newest files first. Persisted.
+  bool _newestFirst = false;
+  static const _prefsNewestFirst = 'library_sort_newest_first';
+
+  List<_LocalRow> get _sortedRows {
+    if (!_newestFirst) return _rows;
+    final epoch = DateTime.fromMillisecondsSinceEpoch(0);
+    return [..._rows]..sort((a, b) => (b.addedAt ?? epoch).compareTo(a.addedAt ?? epoch));
+  }
+
+  Future<void> _setNewestFirst(bool v) async {
+    setState(() => _newestFirst = v);
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_prefsNewestFirst, v);
+    } catch (_) {}
+  }
+
   List<_LocalRow> get _filteredLibraryRows {
     final q = _librarySearchCtl.text.trim().toLowerCase();
-    if (q.isEmpty) return _rows;
+    final rows = _sortedRows;
+    if (q.isEmpty) return rows;
     bool hit(_LocalRow r) {
       if (r.displayName.toLowerCase().contains(q)) return true;
       final title = (r.badging?.label ?? r.title ?? '').toLowerCase();
@@ -94,7 +116,18 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       return false;
     }
 
-    return _rows.where(hit).toList();
+    return rows.where(hit).toList();
+  }
+
+  /// The most recently added library file (only tagged when there is more than one file).
+  String? get _newestPath {
+    if (_rows.length < 2) return null;
+    _LocalRow? best;
+    for (final r in _rows) {
+      if (r.addedAt == null) continue;
+      if (best == null || r.addedAt!.isAfter(best.addedAt!)) best = r;
+    }
+    return best?.path;
   }
 
   List<AdbDevice> get _targets {
@@ -111,6 +144,10 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       if (mounted) setState(() {});
     });
     _finishedSub = _queue.finished.listen(_onJobFinished);
+    SharedPreferences.getInstance().then((prefs) {
+      final v = prefs.getBool(_prefsNewestFirst) ?? false;
+      if (mounted && v != _newestFirst) setState(() => _newestFirst = v);
+    }).catchError((_) {});
     WidgetsBinding.instance.addPostFrameCallback((_) async {
       await _refreshPackages();
       if (mounted && _devices.isEmpty) unawaited(_scanDevices());
@@ -272,7 +309,16 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
         .toList()
       ..sort((a, b) => a.path.toLowerCase().compareTo(b.path.toLowerCase()));
 
-    final rows = files.map(_LocalRow.new).toList();
+    final rows = [
+      for (final f in files)
+        _LocalRow(f)..addedAt = (() {
+          try {
+            return f.statSync().modified;
+          } catch (_) {
+            return null;
+          }
+        })(),
+    ];
     if (!mounted) return;
     setState(() {
       _rows = rows;
@@ -682,6 +728,27 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                             icon: Icon(allVisibleSelected ? Icons.deselect_rounded : Icons.select_all_rounded),
                             label: Text(allVisibleSelected ? 'Deselect' : 'Select all'),
                           ),
+                          PopupMenuButton<bool>(
+                            tooltip: 'Sort library',
+                            initialValue: _newestFirst,
+                            onSelected: _setNewestFirst,
+                            itemBuilder: (_) => const [
+                              PopupMenuItem(value: false, child: Text('Name (A–Z)')),
+                              PopupMenuItem(value: true, child: Text('Newest first')),
+                            ],
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const Icon(Icons.sort_rounded, size: 20),
+                                  const SizedBox(width: 4),
+                                  Text(_newestFirst ? 'Newest' : 'A–Z'),
+                                ],
+                              ),
+                            ),
+                          ),
+                          const DensityToggleButton(),
                         ],
                       ),
                       const SizedBox(height: 10),
@@ -798,17 +865,18 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
               'Android ${props['android']} · API ${props['sdk']}',
             if (props == null && current != null) current.shortLabel,
           ].join(' · ');
+    final compact = DensityController.instance.value;
     return Card(
       child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
+        padding: compact ? const EdgeInsets.fromLTRB(12, 6, 8, 6) : const EdgeInsets.fromLTRB(16, 12, 12, 12),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Row(
               children: [
                 Container(
-                  width: 44,
-                  height: 44,
+                  width: compact ? 32 : 44,
+                  height: compact ? 32 : 44,
                   decoration: BoxDecoration(
                     color: _devices.isEmpty ? scheme.surfaceContainerHighest : scheme.primaryContainer,
                     borderRadius: BorderRadius.circular(12),
@@ -993,10 +1061,10 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       );
     }
     return ListenableBuilder(
-      listenable: _queue,
+      listenable: Listenable.merge([_queue, DensityController.instance]),
       builder: (context, _) => ListView.separated(
         itemCount: visible.length,
-        separatorBuilder: (context, i) => const SizedBox(height: 8),
+        separatorBuilder: (context, i) => SizedBox(height: DensityController.instance.value ? 4 : 8),
         itemBuilder: (context, i) => _buildCard(context, visible[i]),
       ),
     );
@@ -1041,6 +1109,9 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
         row.deviceVersion != null &&
         row.localVersion != null &&
         row.deviceVersion == row.localVersion;
+    final compact = DensityController.instance.value;
+    final iconSize = compact ? 32.0 : 48.0;
+    final isNewest = row.path == _newestPath;
 
     return Card(
       color: selected ? scheme.primaryContainer.withValues(alpha: 0.35) : null,
@@ -1048,7 +1119,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
       child: InkWell(
         onTap: () => setState(() => selected ? _selected.remove(row.path) : _selected.add(row.path)),
         child: Padding(
-          padding: const EdgeInsets.fromLTRB(6, 10, 12, 10),
+          padding: compact ? const EdgeInsets.fromLTRB(2, 3, 8, 3) : const EdgeInsets.fromLTRB(6, 10, 12, 10),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
@@ -1059,33 +1130,67 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                     onChanged: (v) => setState(() => v == true ? _selected.add(row.path) : _selected.remove(row.path)),
                   ),
                   ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
+                    borderRadius: BorderRadius.circular(compact ? 8 : 12),
                     child: row.icon != null
-                        ? Image.memory(row.icon!, width: 48, height: 48, fit: BoxFit.cover, gaplessPlayback: true)
+                        ? Image.memory(row.icon!,
+                            width: iconSize, height: iconSize, fit: BoxFit.cover, gaplessPlayback: true)
                         : Container(
-                            width: 48,
-                            height: 48,
+                            width: iconSize,
+                            height: iconSize,
                             color: scheme.surfaceContainerHighest,
                             child: row.metaBusy
-                                ? const Padding(
-                                    padding: EdgeInsets.all(14),
-                                    child: CircularProgressIndicator(strokeWidth: 2),
+                                ? Padding(
+                                    padding: EdgeInsets.all(compact ? 8 : 14),
+                                    child: const CircularProgressIndicator(strokeWidth: 2),
                                   )
                                 : Icon(row.isXapk ? Icons.layers_outlined : Icons.android_rounded,
                                     color: scheme.onSurfaceVariant),
                           ),
                   ),
-                  const SizedBox(width: 14),
+                  SizedBox(width: compact ? 10 : 14),
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(
-                          row.label,
-                          style: t.titleSmall?.copyWith(fontWeight: FontWeight.w700),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
+                        Row(
+                          children: [
+                            Flexible(
+                              child: Text(
+                                row.label,
+                                style: (compact ? t.bodyMedium : t.titleSmall)?.copyWith(fontWeight: FontWeight.w700),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (isNewest) ...[
+                              const SizedBox(width: 8),
+                              _chip(context, 'Newest',
+                                  icon: Icons.fiber_new_rounded,
+                                  bg: scheme.secondaryContainer,
+                                  fg: scheme.onSecondaryContainer),
+                            ],
+                            if (compact) ...[
+                              const SizedBox(width: 8),
+                              Flexible(
+                                child: Text(
+                                  [
+                                    if (row.localVersion != null && row.localVersion!.trim().isNotEmpty)
+                                      'v${row.localVersion}',
+                                    if (row.isXapk) 'XAPK',
+                                    if (row.installed == true)
+                                      sameAsDevice ? 'Installed' : 'On device v${row.deviceVersion ?? '?'}',
+                                    if (row.remoteVersion != null)
+                                      'Store v${row.remoteVersion}${row.updateAvailable == true ? ' (newer)' : ''}',
+                                  ].join(' · '),
+                                  style: t.labelSmall?.copyWith(color: scheme.onSurfaceVariant),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
+                        if (!compact) ...[
                         const SizedBox(height: 2),
                         Text(
                           [
@@ -1122,6 +1227,7 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                               ),
                           ],
                         ),
+                        ],
                       ],
                     ),
                   ),
@@ -1141,6 +1247,12 @@ class _LocalInstallPageState extends State<LocalInstallPage> {
                         ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
                         : const Icon(Icons.install_mobile_rounded, size: 18),
                     label: Text(busy ? stageLabel(job.stage) : 'Install'),
+                    style: compact
+                        ? FilledButton.styleFrom(
+                            textStyle: t.labelMedium?.copyWith(fontWeight: FontWeight.w600),
+                            minimumSize: const Size(0, 30),
+                          )
+                        : null,
                   ),
                   const SizedBox(width: 4),
                   IconButton(

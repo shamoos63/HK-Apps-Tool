@@ -5,6 +5,7 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
 import 'app_shell_nav.dart';
+import 'app_theme.dart';
 import 'services/adb_service.dart';
 import 'services/app_catalog.dart';
 import 'services/app_paths.dart';
@@ -253,6 +254,7 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
                     selected: prefs.sources.contains(s),
                     onSelected: (v) => _toggleSource(s, v),
                   ),
+                const DensityToggleButton(),
               ],
             ),
             if (_searchError != null) ...[
@@ -314,9 +316,10 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
         ),
       );
     }
+    final compact = DensityController.instance.value;
     return ListView.separated(
       itemCount: _hits.length,
-      separatorBuilder: (_, _) => const SizedBox(height: 6),
+      separatorBuilder: (_, _) => SizedBox(height: compact ? 3 : 6),
       itemBuilder: (context, i) {
         final h = _hits[i];
         final sel = _selected?.packageId == h.packageId;
@@ -326,10 +329,10 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
           child: InkWell(
             onTap: () => _select(h),
             child: Padding(
-              padding: const EdgeInsets.all(10),
+              padding: EdgeInsets.all(compact ? 6 : 10),
               child: Row(
                 children: [
-                  _icon(h.iconUrl),
+                  _icon(h.iconUrl, size: compact ? 30 : 44),
                   const SizedBox(width: 12),
                   Expanded(
                     child: Column(
@@ -345,13 +348,15 @@ class _ApkpureSearchPageState extends State<ApkpureSearchPage> {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                         ),
-                        const SizedBox(height: 2),
-                        Text(
-                          'Found on ${h.foundVia.join(', ')}',
-                          style: t.labelSmall?.copyWith(color: scheme.outline),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
+                        if (!compact) ...[
+                          const SizedBox(height: 2),
+                          Text(
+                            'Found on ${h.foundVia.join(', ')}',
+                            style: t.labelSmall?.copyWith(color: scheme.outline),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ],
                       ],
                     ),
                   ),

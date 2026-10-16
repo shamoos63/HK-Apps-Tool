@@ -67,11 +67,13 @@ ColorScheme _darkScheme() => const ColorScheme(
       inversePrimary: Color(0xFF006876),
     );
 
-ThemeData buildAppTheme() => _build(_lightScheme(), background: const Color(0xFFF2F6FD));
+ThemeData buildAppTheme({bool compact = false}) =>
+    _build(_lightScheme(), background: const Color(0xFFF2F6FD), compact: compact);
 
-ThemeData buildAppDarkTheme() => _build(_darkScheme(), background: const Color(0xFF050608));
+ThemeData buildAppDarkTheme({bool compact = false}) =>
+    _build(_darkScheme(), background: const Color(0xFF050608), compact: compact);
 
-ThemeData _build(ColorScheme scheme, {required Color background}) {
+ThemeData _build(ColorScheme scheme, {required Color background, bool compact = false}) {
   final dark = scheme.brightness == Brightness.dark;
   final radius = BorderRadius.circular(14);
   // Neon glow under primary buttons in dark mode, a soft blue shadow in light mode.
@@ -82,7 +84,7 @@ ThemeData _build(ColorScheme scheme, {required Color background}) {
     colorScheme: scheme,
     scaffoldBackgroundColor: background,
     canvasColor: background,
-    visualDensity: VisualDensity.standard,
+    visualDensity: compact ? VisualDensity.compact : VisualDensity.standard,
     navigationRailTheme: NavigationRailThemeData(
       backgroundColor: dark ? scheme.surfaceContainerLowest : scheme.surface,
       elevation: 0,
@@ -124,7 +126,11 @@ ThemeData _build(ColorScheme scheme, {required Color background}) {
     ),
     filledButtonTheme: FilledButtonThemeData(
       style: ButtonStyle(
-        padding: const WidgetStatePropertyAll(EdgeInsets.symmetric(horizontal: 18, vertical: 12)),
+        padding: WidgetStatePropertyAll(
+          compact
+              ? const EdgeInsets.symmetric(horizontal: 12, vertical: 6)
+              : const EdgeInsets.symmetric(horizontal: 18, vertical: 12),
+        ),
         shape: WidgetStatePropertyAll(RoundedRectangleBorder(borderRadius: radius)),
         shadowColor: WidgetStatePropertyAll(glow),
         elevation: WidgetStateProperty.resolveWith((s) {
@@ -220,4 +226,43 @@ class ThemeController extends ValueNotifier<ThemeMode> {
   /// Flip between light and dark based on what is showing now.
   Future<void> toggle(Brightness current) =>
       set(current == Brightness.dark ? ThemeMode.light : ThemeMode.dark);
+}
+
+/// Compact view: smaller rows and controls so more items fit on screen. Persisted.
+class DensityController extends ValueNotifier<bool> {
+  DensityController._() : super(false);
+
+  static final DensityController instance = DensityController._();
+  static const _key = 'compact_view';
+
+  Future<void> load() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      value = prefs.getBool(_key) ?? false;
+    } catch (_) {}
+  }
+
+  Future<void> toggle() async {
+    value = !value;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(_key, value);
+    } catch (_) {}
+  }
+}
+
+/// Small icon button that switches between comfortable and compact view.
+class DensityToggleButton extends StatelessWidget {
+  const DensityToggleButton({super.key});
+
+  @override
+  Widget build(BuildContext context) => ValueListenableBuilder<bool>(
+        valueListenable: DensityController.instance,
+        builder: (context, compact, _) => IconButton(
+          tooltip: compact ? 'Comfortable view (bigger items)' : 'Compact view (fit more on screen)',
+          isSelected: compact,
+          onPressed: DensityController.instance.toggle,
+          icon: Icon(compact ? Icons.view_headline_rounded : Icons.view_agenda_outlined),
+        ),
+      );
 }
